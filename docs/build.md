@@ -873,8 +873,9 @@ Usage notes:
   device is picked automatically, `GGML_XDNA_VK_DEVICE=<n>` overrides) and a private CPU backend,
   all running at the same time. `GGML_XDNA_NPU_SHARE` / `GGML_XDNA_VK_SHARE` (`0..1`) set the NPU
   and GPU shares, the CPU takes the rest (defaults 0 / 0.8 / 0.2 with Vulkan); `GGML_XDNA_NPU_SHARE=auto`
-  rebalances all shares from the measured times, and is the default without Vulkan (starting from
-  NPU 0.4 / CPU 0.6). With a GPU
+  learns each worker's speed per matrix shape and gives the NPU the number of whole kernel blocks
+  (possibly none) that finishes the operation earliest; it is the default without Vulkan, and the
+  0.4 / 0.6 split only serves the first measurement. With a GPU
   present the NPU only joins products of at least `GGML_XDNA_NPU_MIN_GFLOP` (default 4).
   Measured on the 8700G (`-nr -ngl 0`, 476-token prompt, best of 2): Qwen3-0.6B Q4_0 — Vulkan
   worker alone ~670 t/s, Vulkan 0.8 + CPU 0.2 ~715 t/s, CPU only ~390 t/s, every split that
@@ -892,9 +893,9 @@ Usage notes:
   current AMD Windows driver (~50 MB/s), which is why the copy path and any GPU→host split
   boundary cost so much more than the compute itself.
   Measured on a Ryzen 7 8700G (CPU+NPU build, `-nr`, ~476-token prompt, 8 threads, median of 5):
-  Qwen3-0.6B Q4_0 — CPU only 402 t/s, NPU only 365, CPU+NPU 505 with the `auto` default (467 at 0.4);
-  gemma-4-E2B Q4_K_M — CPU only 115, NPU only 97, CPU+NPU 139 with `auto` (141 at 0.4). The stock repacked
-  CPU path, which the NPU cannot join yet, is still faster (568 / 206 t/s). Decode is unchanged.
+  Qwen3-0.6B Q4_0 — CPU only 398 t/s, NPU only 380, CPU+NPU 518 with the `auto` default (474 at 0.4);
+  gemma-4-E2B Q4_K_M — CPU only 125, NPU only 105, CPU+NPU 162 with `auto` (164 at 0.4). The stock repacked
+  CPU path, which the NPU cannot join yet, is still faster (582 / 217 t/s). Decode is unchanged.
 - The scheduler-level combination also works: with `-ngl N` the first N layers live on the Vulkan
   device and the remaining layers' prompt matmuls go through the XDNA backend (and its workers).
 - The NPU's blocks are pipelined (the host stages the next block while the NPU computes the current

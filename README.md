@@ -30,6 +30,8 @@ For everything else about llama.cpp — installation, models, tools, the server,
   with Vulkan, a Vulkan backend on the integrated GPU. On the APU's shared memory the Vulkan worker reads the
   activations and writes its results in place, and keeps weight slices cached on the GPU.
 - For each block the backend picks the NPU kernel with the lowest measured launch time.
+- By default (`auto`) the backend learns how fast each worker is for every matrix shape, and gives the NPU the number
+  of rows — in whole kernel blocks, possibly none — that makes the operation finish earliest.
 
 ## Results
 
@@ -44,12 +46,12 @@ NPU, well within the measurement's error.
 
 | configuration | Qwen3-0.6B Q4_0 | gemma-4-E2B Q4_K_M |
 |---|---:|---:|
-| CPU only, stock (repacked weights) | 568 | 206 |
-| CPU only | 402 | 115 |
-| NPU only | 365 | 97 |
-| CPU + NPU, NPU share 0.4 | 467 | 141 |
-| CPU + NPU, NPU share 0.5 | 484 | 134 |
-| CPU + NPU, `auto` (default) | 505 | 139 |
+| CPU only, stock (repacked weights) | 582 | 217 |
+| CPU only | 398 | 125 |
+| NPU only | 380 | 105 |
+| CPU + NPU, NPU share 0.4 | 474 | 164 |
+| CPU + NPU, NPU share 0.5 | 509 | 153 |
+| CPU + NPU, `auto` (default) | 518 | 162 |
 
 Token generation speed is the same in every configuration (~90 tokens/s for Qwen3-0.6B, ~30 for gemma-4-E2B).
 
@@ -63,10 +65,11 @@ Token generation speed is the same in every configuration (~90 tokens/s for Qwen
 
 **What this shows:**
 
-- CPU + NPU is faster than the CPU alone in the same configuration: +16–26% on Qwen3-0.6B and +16–23% on
-  gemma-4-E2B at NPU shares 0.3–0.5 or `auto`. Pipelining the NPU blocks and caching bf16 weights made the NPU alone
-  17–26% faster (365 vs 311 tokens/s on Qwen3-0.6B, 97 vs 77 on gemma-4-E2B).
-- The stock CPU path is still faster overall (~12% ahead on Qwen3-0.6B, ~45% on gemma-4-E2B). Its repacked weight
+- CPU + NPU is faster than the CPU alone in the same configuration: +19–30% on Qwen3-0.6B and +19–31% on
+  gemma-4-E2B at NPU shares 0.3–0.5 or `auto`. `auto` is the fastest on Qwen3-0.6B and ties the best fixed share on
+  gemma-4-E2B, without tuning per model. Pipelining the NPU blocks and caching bf16 weights made the NPU alone 17–26%
+  faster in the same conditions (311 → 365 tokens/s on Qwen3-0.6B, 77 → 97 on gemma-4-E2B).
+- The stock CPU path is still faster overall (~12% ahead on Qwen3-0.6B, ~34% on gemma-4-E2B). Its repacked weight
   layout is invisible to other backends, so the NPU can only take part with `--no-repack`.
 - The 780M is roughly 10× faster than the XDNA1 at batched matrix multiply. Next to it the NPU only makes each
   operation finish later, so it is off by default when a Vulkan worker is available.

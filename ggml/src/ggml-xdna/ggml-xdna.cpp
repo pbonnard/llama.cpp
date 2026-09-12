@@ -339,8 +339,8 @@ struct ggml_backend_xdna_context {
     // Work split: the output features of each MUL_MAT are divided between the NPU, a private
     // Vulkan backend (the integrated GPU) and a private CPU backend, all running concurrently.
     // share[] holds the fraction per worker: fixed (defaults below, or GGML_XDNA_NPU_SHARE /
-    // GGML_XDNA_VK_SHARE, CPU takes the rest), or rebalanced from the measured times of the
-    // workers (the default without a Vulkan worker, or GGML_XDNA_NPU_SHARE=auto).
+    // GGML_XDNA_VK_SHARE, CPU takes the rest), or chosen per operation from the workers' measured
+    // speeds (auto: the default without a Vulkan worker, or GGML_XDNA_NPU_SHARE=auto).
     ggml_backend_t cpu = nullptr;
     ggml_backend_t vk  = nullptr;
     bool  vk_tried = false;
@@ -378,6 +378,15 @@ struct ggml_backend_xdna_context {
     std::map<std::tuple<const void *, int64_t, int64_t>, npu_weight> npu_weights;
     size_t npu_weight_bytes = 0;
     size_t npu_weight_limit = (size_t) 4 << 30;
+
+    // auto split: each worker's measured speed per matrix shape (n_feat, K, src0 type), in
+    // rows*tokens per ms, and its average rate in MACs per ms as the prior for unseen shapes
+    struct shape_perf {
+        double thr[3] = { 0.0, 0.0, 0.0 };   // NPU, VK, CPU
+    };
+    std::map<std::tuple<int64_t, int64_t, int>, shape_perf> shape_perf_map;
+    double mac_thr[3] = { 0.0, 0.0, 0.0 };   // NPU, VK, CPU
+    bool   npu_cold   = false;                // the current op loaded an NPU kernel (its time is not learned)
 };
 
 enum ggml_xdna_worker {
@@ -711,8 +720,8 @@ static void ggml_xdna_init_shares(ggml_backend_xdna_context * ctx) {
     // GGML_XDNA_NPU_MIN_GFLOP keeps it to the large products where it has a chance.
     float npu = have_vk ? 0.0f : 0.4f;
     float vkf = have_vk ? 0.8f : 0.0f;
-    // without a GPU the NPU/CPU split starts at 0.4 / 0.6 and rebalances from the measured times
-    // (auto): best or tied with the best fixed share on Qwen3-0.6B and gemma-4-E2B after pipelining
+    // without a GPU the split is chosen per operation from measured speeds (auto, see
+    // ggml_xdna_plan_auto); the 0.4 / 0.6 shares only serve the first measurement
     ctx->share_fixed = have_vk;
     ctx->npu_min_gflop = have_vk ? 4.0 : 0.0;
     if (const char * env = ggml_xdna_getenv("GGML_XDNA_NPU_MIN_GFLOP")) {
@@ -966,7 +975,11 @@ static void ggml_xdna_mul_mat_npu(ggml_backend_xdna_context * ctx, struct ggml_t
     // the NPU is a single device and the kernel's slots are shared: hold the state lock for the op
     std::lock_guard<std::mutex> lock(st.mutex);
 
+    const bool was_loaded = k.loaded;
     bool use_npu = ggml_xdna_kernel_load(st, k);
+    if (use_npu && !was_loaded) {
+        ctx->npu_cold = true;   // this op paid for loading the kernel: its time says nothing about the NPU's speed
+    }
     if (!use_npu && !ctx->warned_fallback) {
         GGML_LOG_WARN("%s: NPU kernel unavailable, computing on the host instead\n", __func__);
         ctx->warned_fallback = true;
@@ -1078,6 +1091,83 @@ static void ggml_xdna_mul_mat_npu(ggml_backend_xdna_context * ctx, struct ggml_t
     }
 }
 
+// auto split: choose how many rows each worker gets by predicted finish time. The NPU takes whole
+// kernel blocks (none, some, or all rows); the rest is shared by the Vulkan and CPU workers in
+// proportion to their speed. Speeds are learned per matrix shape; for a shape not seen yet the NPU
+// is estimated from its kernel's per-block time and the other workers from their average MAC rate.
+// Returns false until the Vulkan/CPU workers have been measured once (the caller then uses the
+// default shares, which measures them).
+static bool ggml_xdna_plan_auto(ggml_backend_xdna_context * ctx, ggml_xdna_state & st, const struct ggml_tensor * dst,
+                                bool npu_ok, int64_t n[], double * t_pred) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const int64_t n_feat = src0->ne[1];
+    const int64_t n_k    = src0->ne[0];
+    const int64_t n_tok  = dst->src[1]->ne[1];
+
+    const bool vk_on  = ctx->vk  != nullptr && ctx->share[GGML_XDNA_WORKER_VK]  > 0.0f;
+    const bool cpu_on = ctx->cpu != nullptr && ctx->share[GGML_XDNA_WORKER_CPU] > 0.0f;
+
+    const auto     it  = ctx->shape_perf_map.find(std::make_tuple(n_feat, n_k, (int) src0->type));
+    const double * thr = it != ctx->shape_perf_map.end() ? it->second.thr : nullptr;
+
+    // ms per row on worker i, or -1 if it has never been measured
+    auto ms_per_row = [&](int i) -> double {
+        if (thr != nullptr && thr[i] > 0.0) {
+            return (double) n_tok/thr[i];
+        }
+        if (ctx->mac_thr[i] > 0.0) {
+            return (double) n_k*n_tok/ctx->mac_thr[i];
+        }
+        return -1.0;
+    };
+
+    const double r_vk  = vk_on  ? ms_per_row(GGML_XDNA_WORKER_VK)  : 0.0;
+    const double r_cpu = cpu_on ? ms_per_row(GGML_XDNA_WORKER_CPU) : 0.0;
+    if ((!vk_on && !cpu_on) || r_vk < 0.0 || r_cpu < 0.0) {
+        return false;
+    }
+    // rows per ms of the Vulkan and CPU workers together
+    const double rest_rate = (vk_on ? 1.0/r_vk : 0.0) + (cpu_on ? 1.0/r_cpu : 0.0);
+
+    const ggml_xdna_kernel * kp = npu_ok ? ggml_xdna_select_kernel(st, n_feat, n_k, n_tok) : nullptr;
+    const double npu_ms_per_row = thr != nullptr && thr[GGML_XDNA_WORKER_NPU] > 0.0 ? (double) n_tok/thr[GGML_XDNA_WORKER_NPU] : -1.0;
+    auto t_npu = [&](int64_t c) -> double {
+        if (npu_ms_per_row > 0.0) {
+            return c*npu_ms_per_row;
+        }
+        const double blocks = (double) ((c + kp->M - 1)/kp->M) * ((n_k + kp->K - 1)/kp->K) * ((n_tok + kp->N - 1)/kp->N);
+        return blocks*ggml_xdna_kernel_launch_us(*kp)/1000.0;
+    };
+
+    int64_t best_c = 0;
+    double  best_t = (double) n_feat/rest_rate;
+    if (kp != nullptr) {
+        for (int64_t c = kp->M; ; c += kp->M) {
+            c = std::min(c, n_feat);
+            const double t = std::max(t_npu(c), (n_feat - c)/rest_rate);
+            if (t < best_t) {
+                best_t = t;
+                best_c = c;
+            }
+            if (c == n_feat) {
+                break;
+            }
+        }
+    }
+
+    const int64_t rest = n_feat - best_c;
+    n[GGML_XDNA_WORKER_NPU] = best_c;
+    n[GGML_XDNA_WORKER_VK]  = 0;
+    if (vk_on && cpu_on) {
+        n[GGML_XDNA_WORKER_VK] = std::min(rest, (int64_t) (rest*(1.0/r_vk)/rest_rate + 32) / 64 * 64);
+    } else if (vk_on) {
+        n[GGML_XDNA_WORKER_VK] = rest;
+    }
+    n[GGML_XDNA_WORKER_CPU] = rest - n[GGML_XDNA_WORKER_VK];
+    *t_pred = best_t;
+    return true;
+}
+
 static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1112,22 +1202,35 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     const double gflop = 2.0*n_feat*ne00*ne11/1e9;
     const bool npu_worthwhile = gflop >= ctx->npu_min_gflop || (ctx->vk == nullptr && ctx->cpu == nullptr);
 
+    const float share_used[GGML_XDNA_N_WORKERS] = {
+        ctx->share[GGML_XDNA_WORKER_NPU], ctx->share[GGML_XDNA_WORKER_VK], ctx->share[GGML_XDNA_WORKER_CPU] };
+
     int64_t n[GGML_XDNA_N_WORKERS] = { 0, 0, 0 };
 
-    if (ctx->share[GGML_XDNA_WORKER_NPU] >= 1.0f || (ctx->vk == nullptr && ctx->cpu == nullptr)) {
-        n[GGML_XDNA_WORKER_NPU] = n_feat;
-    } else if (ctx->share[GGML_XDNA_WORKER_NPU] > 0.0f && npu_worthwhile) {
-        const int64_t target = std::max<int64_t>(1, (int64_t) (n_feat*ctx->share[GGML_XDNA_WORKER_NPU]));
-        const ggml_xdna_kernel * kp = ggml_xdna_select_kernel(st, target, ne00, ne11);
-        const int64_t kM = kp ? kp->M : 512;
-        n[GGML_XDNA_WORKER_NPU] = std::min((target + kM/2)/kM*kM, n_feat);
-        if (n[GGML_XDNA_WORKER_NPU] > 0 && n_feat - n[GGML_XDNA_WORKER_NPU] < 64) {
-            n[GGML_XDNA_WORKER_NPU] = n_feat;
-        }
+    const char * mode    = "fixed";
+    double       t_pred  = 0.0;
+    bool         planned = false;
+    if (!ctx->share_fixed && (ctx->vk != nullptr || ctx->cpu != nullptr)) {
+        planned = ggml_xdna_plan_auto(ctx, st, dst, npu_worthwhile, n, &t_pred);
+        mode    = planned ? "auto" : "explore";
     }
-    if (ctx->vk && ctx->share[GGML_XDNA_WORKER_VK] > 0.0f) {
-        n[GGML_XDNA_WORKER_VK] = (int64_t) (n_feat*ctx->share[GGML_XDNA_WORKER_VK] + 32) / 64 * 64;
-        n[GGML_XDNA_WORKER_VK] = std::min(n[GGML_XDNA_WORKER_VK], n_feat - n[GGML_XDNA_WORKER_NPU]);
+
+    if (!planned) {
+        if (ctx->share[GGML_XDNA_WORKER_NPU] >= 1.0f || (ctx->vk == nullptr && ctx->cpu == nullptr)) {
+            n[GGML_XDNA_WORKER_NPU] = n_feat;
+        } else if (ctx->share[GGML_XDNA_WORKER_NPU] > 0.0f && npu_worthwhile) {
+            const int64_t target = std::max<int64_t>(1, (int64_t) (n_feat*ctx->share[GGML_XDNA_WORKER_NPU]));
+            const ggml_xdna_kernel * kp = ggml_xdna_select_kernel(st, target, ne00, ne11);
+            const int64_t kM = kp ? kp->M : 512;
+            n[GGML_XDNA_WORKER_NPU] = std::min((target + kM/2)/kM*kM, n_feat);
+            if (n[GGML_XDNA_WORKER_NPU] > 0 && n_feat - n[GGML_XDNA_WORKER_NPU] < 64) {
+                n[GGML_XDNA_WORKER_NPU] = n_feat;
+            }
+        }
+        if (ctx->vk && ctx->share[GGML_XDNA_WORKER_VK] > 0.0f) {
+            n[GGML_XDNA_WORKER_VK] = (int64_t) (n_feat*ctx->share[GGML_XDNA_WORKER_VK] + 32) / 64 * 64;
+            n[GGML_XDNA_WORKER_VK] = std::min(n[GGML_XDNA_WORKER_VK], n_feat - n[GGML_XDNA_WORKER_NPU]);
+        }
     }
     n[GGML_XDNA_WORKER_CPU] = n_feat - n[GGML_XDNA_WORKER_NPU] - n[GGML_XDNA_WORKER_VK];
     if (n[GGML_XDNA_WORKER_CPU] > 0 && (ctx->cpu == nullptr || n[GGML_XDNA_WORKER_CPU] < 16)) {
@@ -1145,6 +1248,7 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     double t[GGML_XDNA_N_WORKERS] = { 0.0, 0.0, 0.0 };
     bool   vk_ok = true, cpu_ok = true;
 
+    ctx->npu_cold = false;
     std::thread npu_thread, vk_thread;
     if (n[GGML_XDNA_WORKER_NPU] > 0) {
         npu_thread = std::thread([&]() {
@@ -1179,27 +1283,27 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     }
 
     if (!ctx->share_fixed && vk_ok && cpu_ok) {
-        // rebalance towards equal finishing times: each worker's rate is rows/time
-        double rate[GGML_XDNA_N_WORKERS] = { 0.0, 0.0, 0.0 };
-        double sum = 0.0;
+        // learn each worker's speed for this matrix shape (rows*tokens per ms) and overall (MACs per ms)
+        auto & sp = ctx->shape_perf_map[std::make_tuple(n_feat, ne00, (int) src0->type)];
         for (int i = 0; i < GGML_XDNA_N_WORKERS; i++) {
-            if (n[i] > 0 && t[i] > 0.0) {
-                rate[i] = (double) n[i]/t[i];
-                sum += rate[i];
+            if (n[i] > 0 && t[i] > 0.0 && !(i == GGML_XDNA_WORKER_NPU && ctx->npu_cold)) {
+                const double thr = (double) n[i]*ne11/(t[i]*1e3);
+                sp.thr[i]       = sp.thr[i]       > 0.0 ? 0.7*sp.thr[i]       + 0.3*thr      : thr;
+                ctx->mac_thr[i] = ctx->mac_thr[i] > 0.0 ? 0.9*ctx->mac_thr[i] + 0.1*thr*ne00 : thr*ne00;
             }
         }
-        if (sum > 0.0) {
-            float total = 0.0f;
-            for (int i = 0; i < GGML_XDNA_N_WORKERS; i++) {
-                if (n[i] > 0) {
-                    ctx->share[i] = (float) std::max(0.05, 0.85*ctx->share[i] + 0.15*rate[i]/sum);
-                }
-                total += ctx->share[i];
-            }
-            for (int i = 0; i < GGML_XDNA_N_WORKERS; i++) {
-                ctx->share[i] /= total;
-            }
-        }
+    }
+
+    if (ggml_xdna_debug()) {
+        static int op_id = 0;
+        GGML_LOG_INFO("xdna_split: op=%d feat=%" PRId64 " k=%" PRId64 " tok=%" PRId64 " rows=%" PRId64 "/%" PRId64 "/%" PRId64
+                      " t_ms=%.3f/%.3f/%.3f share=%.3f/%.3f/%.3f -> %.3f/%.3f/%.3f mode=%s pred_ms=%.3f cold=%d\n",
+                      op_id++, n_feat, ne00, ne11,
+                      n[GGML_XDNA_WORKER_NPU], n[GGML_XDNA_WORKER_VK], n[GGML_XDNA_WORKER_CPU],
+                      t[GGML_XDNA_WORKER_NPU]*1e3, t[GGML_XDNA_WORKER_VK]*1e3, t[GGML_XDNA_WORKER_CPU]*1e3,
+                      share_used[GGML_XDNA_WORKER_NPU], share_used[GGML_XDNA_WORKER_VK], share_used[GGML_XDNA_WORKER_CPU],
+                      ctx->share[GGML_XDNA_WORKER_NPU], ctx->share[GGML_XDNA_WORKER_VK], ctx->share[GGML_XDNA_WORKER_CPU],
+                      mode, t_pred, (int) ctx->npu_cold);
     }
 }
 
