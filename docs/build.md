@@ -898,9 +898,10 @@ Usage notes:
   Qwen3-0.6B Q4_0 — CPU only 398 t/s, NPU only 380, CPU+NPU 518 with the `auto` default (474 at 0.4);
   gemma-4-E2B Q4_K_M — CPU only 125, NPU only 105, CPU+NPU 162 with `auto` (164 at 0.4). The stock repacked
   CPU path is still faster (582 / 217 t/s); with repacked weights (no `-nr`) CPU+NPU beats it once
-  the NPU's bf16 weight cache is warm (`llama-bench -p 512 -r 5`: Qwen3-0.6B Q4_0 754 vs 642 t/s,
-  gemma-4-E2B Q4_K_M 262 vs 225) and ties it on a single cold prompt (590 vs 581, 210 vs 213),
-  which pays the kernel loads and weight conversion. With the NPU's share at 0 the XDNA path costs
+  the NPU's bf16 weight cache is warm (`llama-bench -p 512 -r 5`: Qwen3-0.6B Q4_0 ~800 vs ~600 t/s,
+  gemma-4-E2B Q4_K_M ~270 vs ~218). llama-server's first request, after the load-time warm-up,
+  runs at 615–708 vs 544–592 t/s (Qwen3-0.6B) and 229–260 vs 202–224 (gemma-4-E2B); a prompt
+  that arrives during loading only ties the CPU, since it pays the remaining weight conversion. With the NPU's share at 0 the XDNA path costs
   ~3% on Qwen3-0.6B (an extra graph split per matmul) and nothing measurable on gemma-4-E2B.
   Decode is unchanged.
 - The scheduler-level combination also works: with `-ngl N` the first N layers live on the Vulkan
@@ -908,7 +909,16 @@ Usage notes:
 - The NPU's blocks are pipelined (the host stages the next block while the NPU computes the current
   one), and the bf16 copies of the model weights it handles are converted once and cached, up to
   `GGML_XDNA_NPU_CACHE_MB` (default 4096; `0` converts on every call). Only tensors in model-weight
-  buffers are cached by either the NPU or the Vulkan worker.
+  buffers are cached by either the NPU or the Vulkan worker. The NPU's cache is shared by all
+  XDNA backends and keeps the leading rows of each weight, extending them when a split gives the
+  NPU more rows.
+- Load-time warm-up: while llama.cpp reserves its compute graphs, the weights the NPU will handle
+  are queued, and a background thread loads their kernels and converts the rows the NPU is
+  expected to take (about half with the auto split, or the fixed `GGML_XDNA_NPU_SHARE`; nothing
+  when the NPU is off next to a Vulkan worker), so a server's first prompt does not pay for it (gemma-4-E2B: 216 weights, ~2 GB of bf16, 1.7 s;
+  Qwen3-0.6B: 193 weights, 411 MB, 1.2 s).
+  The first NPU operation stops the warm-up, and whatever it had not reached is converted on first
+  use as before. `GGML_XDNA_NPU_WARM=0` turns it off.
 - `GGML_XDNA_DEBUG=1` logs every `supports_op` decision; `GGML_XDNA_MIN_BATCH=<n>` raises the token
   threshold (a very large value disables NPU use without rebuilding). `GGML_XDNA_DISABLE=1` removes
   the device altogether without opening the NPU (useful for `--version` / `--list-devices` side

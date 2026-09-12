@@ -38,8 +38,10 @@
 #include "xrt/xrt_kernel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -102,6 +104,12 @@ struct ggml_xdna_kernel {
     int    n_ops     = 0;
 };
 
+// a weight queued for the load-time warm-up
+struct ggml_xdna_warm_item {
+    ggml_tensor t;       // copy of the weight's metadata; its data outlives the XDNA backends
+    int64_t     n_tok;   // batch size of the reserved graph, for the kernel choice
+};
+
 // process-wide device + kernel table, shared by the device (supports_op) and the backend
 struct ggml_xdna_state {
     std::mutex mutex;
@@ -116,6 +124,43 @@ struct ggml_xdna_state {
     std::vector<ggml_xdna_kernel> kernels;
 
     int64_t min_batch = 32;   // smallest ne11 (tokens) worth sending to the NPU
+
+    std::atomic<bool> probe_done{false};   // lets supports_op skip the lock once probed
+
+    // bf16 copies of the weight rows the NPU handles, shared by all XDNA backends and keyed by
+    // weight plane. The NPU always takes the first rows of an op, so rows [0, n_rows) are kept and
+    // extended when a later split gives it more; a sampled signature of the plane catches reused
+    // addresses. Up to GGML_XDNA_NPU_CACHE_MB, filled on first use or by the warm-up thread, which
+    // only ever inserts new entries (so an op's pointer into an entry stays valid).
+    struct npu_weight {
+        std::vector<ggml_bf16_t> data;
+        int64_t                  n_rows = 0;
+        uint64_t                 sig    = 0;
+    };
+    std::mutex                         cache_mutex;   // taken after mutex, never before it
+    std::map<const void *, npu_weight> npu_weights;
+    size_t                             npu_weight_bytes = 0;
+
+    // load-time warm-up: while llama.cpp reserves its graphs, supports_op queues the weights the NPU
+    // will handle, and a background thread loads their kernels and converts the NPU's expected rows,
+    // so that the first prompt does not pay for it. The first NPU op stops it.
+    std::mutex                       warm_mutex;
+    std::condition_variable          warm_cv;
+    std::thread                      warm_thread;
+    bool                             warm_running = false;
+    std::vector<ggml_xdna_warm_item> warm_queue;
+    std::map<const void *, bool>     warm_seen;
+    std::atomic<bool>                warm_stop{false};
+    float                            warm_share = 0.0f;   // expected NPU share of an op's rows (0: no warm-up)
+    int                              n_backends = 0;
+
+    ~ggml_xdna_state() {
+        warm_stop = true;
+        warm_cv.notify_all();
+        if (warm_thread.joinable()) {
+            warm_thread.join();
+        }
+    }
 };
 
 static ggml_xdna_state & ggml_xdna_get_state() {
@@ -132,6 +177,15 @@ static const char * ggml_xdna_getenv(const char * name) {
 static bool ggml_xdna_debug() {
     static const bool debug = ggml_xdna_getenv("GGML_XDNA_DEBUG") != nullptr;
     return debug;
+}
+
+// memory for the NPU's cached bf16 weights: GGML_XDNA_NPU_CACHE_MB (default 4096)
+static size_t ggml_xdna_npu_cache_limit() {
+    static const size_t limit = []() {
+        const char * env = ggml_xdna_getenv("GGML_XDNA_NPU_CACHE_MB");
+        return env != nullptr ? (size_t) std::max(0LL, std::atoll(env)) << 20 : (size_t) 4 << 30;
+    }();
+    return limit;
 }
 
 // the CPU backend's repack buffer holds weights re-laid out for its SIMD kernels; its buffer type
@@ -195,8 +249,18 @@ static void ggml_xdna_scan_kernels(ggml_xdna_state & st, const std::string & dir
 }
 
 // open the NPU and enumerate kernels; cheap, done once
+static void ggml_xdna_probe_locked(ggml_xdna_state & st);
+
 static void ggml_xdna_probe(ggml_xdna_state & st) {
+    if (st.probe_done.load(std::memory_order_acquire)) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(st.mutex);
+    ggml_xdna_probe_locked(st);
+    st.probe_done.store(true, std::memory_order_release);
+}
+
+static void ggml_xdna_probe_locked(ggml_xdna_state & st) {
     if (st.probed) {
         return;
     }
@@ -411,20 +475,12 @@ struct ggml_backend_xdna_context {
     size_t vk_weight_bytes = 0;
     size_t vk_weight_limit = (size_t) 8 << 30;
 
-    // bf16 copies of the weight rows the NPU handles, converted once and reused across calls,
-    // keyed by (plane pointer, row range) and guarded by the same sampled content signature
-    struct npu_weight {
-        std::vector<ggml_bf16_t> data;
-        uint64_t                 sig = 0;
-    };
-    std::map<std::tuple<const void *, int64_t, int64_t>, npu_weight> npu_weights;
-    size_t npu_weight_bytes = 0;
-    size_t npu_weight_limit = (size_t) 4 << 30;
-
     // auto split: each worker's measured speed per matrix shape (n_feat, K, src0 type), in
     // rows*tokens per ms, and its average rate in MACs per ms as the prior for unseen shapes
     struct shape_perf {
         double thr[3] = { 0.0, 0.0, 0.0 };   // NPU, VK, CPU
+        bool   npu_seen  = false;             // the NPU has run this shape (its first run is not learned)
+        int    npu_skips = 0;                 // ops planned without the NPU since it was measured
     };
     std::map<std::tuple<int64_t, int64_t, int>, shape_perf> shape_perf_map;
     double mac_thr[3] = { 0.0, 0.0, 0.0 };   // NPU, VK, CPU
@@ -822,9 +878,6 @@ static void ggml_xdna_init_shares(ggml_backend_xdna_context * ctx) {
     if (const char * env = ggml_xdna_getenv("GGML_XDNA_VK_CACHE_MB")) {
         ctx->vk_weight_limit = (size_t) std::max(0LL, std::atoll(env)) << 20;
     }
-    if (const char * env = ggml_xdna_getenv("GGML_XDNA_NPU_CACHE_MB")) {
-        ctx->npu_weight_limit = (size_t) std::max(0LL, std::atoll(env)) << 20;
-    }
     if (npu + vkf > 1.0f) {
         vkf = 1.0f - npu;
     }
@@ -1107,8 +1160,9 @@ static void ggml_xdna_block_gemm_host(const ggml_bf16_t * a, const ggml_bf16_t *
 }
 
 // bf16 weight rows [row0, row0 + n_rows) of plane (i02, i03) of src0, row stride ne00: contiguous
-// bf16 weights are used in place; other model weights are converted once and kept in a per-backend
-// cache (up to GGML_XDNA_NPU_CACHE_MB); anything else is converted into the staging buffer
+// bf16 weights are used in place; the leading rows of other model weights come from the shared cache
+// (ggml_xdna_state::npu_weights), converted once and extended as needed; anything else is converted
+// into the staging buffer. Called with st.mutex held, so ops never race each other on an entry.
 static const ggml_bf16_t * ggml_xdna_npu_weights(ggml_backend_xdna_context * ctx, const ggml_tensor * src0,
                                                  int64_t row0, int64_t n_rows, int64_t i02, int64_t i03) {
     const int64_t n_k   = src0->ne[0];
@@ -1119,27 +1173,31 @@ static const ggml_bf16_t * ggml_xdna_npu_weights(ggml_backend_xdna_context * ctx
         return (const ggml_bf16_t *) rows;
     }
 
-    const size_t bytes = (size_t) n_rows*n_k*sizeof(ggml_bf16_t);
+    if (row0 == 0 && ggml_xdna_is_weight(src0)) {
+        ggml_xdna_state & st  = ggml_xdna_get_state();
+        const uint64_t    sig = ggml_xdna_weight_sig(plane, src0->ne[1]*src0->nb[1], src0->type, n_k);
 
-    if (ggml_xdna_is_weight(src0)) {
-        const uint64_t sig = ggml_xdna_weight_sig(rows, n_rows*src0->nb[1], src0->type, n_k);
-        const auto     key = std::make_tuple((const void *) plane, row0, row0 + n_rows);
-
-        auto it = ctx->npu_weights.find(key);
-        if (it != ctx->npu_weights.end()) {
-            if (it->second.sig == sig) {
-                return it->second.data.data();
-            }
+        std::lock_guard<std::mutex> lock(st.cache_mutex);
+        auto it = st.npu_weights.find(plane);
+        if (it != st.npu_weights.end() && it->second.sig != sig) {
             // the address was reused by different weights: drop the stale copy
-            ctx->npu_weight_bytes -= it->second.data.size()*sizeof(ggml_bf16_t);
-            ctx->npu_weights.erase(it);
+            st.npu_weight_bytes -= it->second.data.size()*sizeof(ggml_bf16_t);
+            st.npu_weights.erase(it);
+            it = st.npu_weights.end();
         }
-        if (ctx->npu_weight_bytes + bytes <= ctx->npu_weight_limit) {
-            auto & w = ctx->npu_weights[key];
+        const int64_t have = it != st.npu_weights.end() ? it->second.n_rows : 0;
+        if (have >= n_rows) {
+            return it->second.data.data();
+        }
+        const size_t add = (size_t) (n_rows - have)*n_k*sizeof(ggml_bf16_t);
+        if (st.npu_weight_bytes + add <= ggml_xdna_npu_cache_limit()) {
+            auto & w = st.npu_weights[plane];
             w.data.resize((size_t) n_rows*n_k);
-            w.sig = sig;
-            ggml_xdna_weight_rows_to_bf16(ctx, src0, row0, n_rows, i02, i03, w.data.data(), n_k);
-            ctx->npu_weight_bytes += bytes;
+            ggml_xdna_weight_rows_to_bf16(ctx, src0, have, n_rows - have, i02, i03, w.data.data() + have*n_k, n_k);
+            w.n_rows = n_rows;
+            w.sig    = sig;
+            st.npu_weight_bytes += add;
+            ctx->npu_cold = true;   // this op paid for a conversion: its time says nothing about the NPU's speed
             return w.data.data();
         }
     }
@@ -1161,6 +1219,7 @@ static void ggml_xdna_mul_mat_npu(ggml_backend_xdna_context * ctx, struct ggml_t
     GGML_TENSOR_BINARY_OP_LOCALS
 
     ggml_xdna_state & st = ggml_xdna_get_state();
+    st.warm_stop = true;   // the NPU is in use: conversion on first use takes over from the warm-up
 
     const int64_t n_k    = ne00;           // reduction length
     const int64_t n_feat = feat1 - feat0;  // output features handled here (weight rows)
@@ -1291,6 +1350,201 @@ static void ggml_xdna_mul_mat_npu(ggml_backend_xdna_context * ctx, struct ggml_t
     }
 }
 
+// load-time warm-up (see ggml_xdna_state): loads the kernels of the queued weights and converts the
+// rows the NPU is expected to take, until the queue has been empty for a second, the cache is full,
+// or the first NPU op starts
+static void ggml_xdna_warm_run() {
+    ggml_xdna_state & st = ggml_xdna_get_state();
+
+    ggml_backend_xdna_context wctx;   // only for ggml_xdna_parallel_for
+    wctx.n_threads = std::max(1, (int) std::thread::hardware_concurrency()/2);
+
+    const auto t_start   = std::chrono::steady_clock::now();
+    int        n_weights = 0;
+    int        n_kernels = 0;
+    size_t     n_bytes   = 0;
+    bool       full      = false;
+
+    for (;;) {
+        ggml_xdna_warm_item item;
+        float share;
+        {
+            std::unique_lock<std::mutex> lock(st.warm_mutex);
+            st.warm_cv.wait_for(lock, std::chrono::seconds(1), [&]() { return !st.warm_queue.empty() || st.warm_stop; });
+            if (st.warm_queue.empty() || st.warm_stop || full) {
+                st.warm_queue.clear();
+                st.warm_running = false;
+                break;
+            }
+            item = st.warm_queue.front();
+            st.warm_queue.erase(st.warm_queue.begin());
+            share = st.warm_share;
+        }
+
+        const ggml_tensor & t      = item.t;
+        const int64_t       n_k    = t.ne[0];
+        const int64_t       n_feat = t.ne[1];
+
+        // the rows the NPU is expected to take, rounded to its kernel's blocks like a fixed split
+        const int64_t target = std::max<int64_t>(1, (int64_t) (n_feat*share));
+        ggml_xdna_kernel * kp = ggml_xdna_select_kernel(st, target, n_k, item.n_tok);
+        if (kp == nullptr) {
+            continue;
+        }
+        int64_t rows = std::min((target + kp->M/2)/kp->M*kp->M, n_feat);
+        if (rows > 0 && n_feat - rows < 64) {
+            rows = n_feat;
+        }
+        if (rows == 0) {
+            continue;
+        }
+
+        // the kernel for those rows, and the one the auto split plans the whole op with
+        for (ggml_xdna_kernel * k : { ggml_xdna_select_kernel(st, rows, n_k, item.n_tok), ggml_xdna_select_kernel(st, n_feat, n_k, item.n_tok) }) {
+            if (k != nullptr && !st.warm_stop) {
+                std::lock_guard<std::mutex> lock(st.mutex);
+                if (!k->loaded && !k->broken && ggml_xdna_kernel_load(st, *k)) {
+                    n_kernels++;
+                }
+            }
+        }
+
+        if (t.type == GGML_TYPE_BF16 && t.nb[1] == (size_t) n_k*sizeof(ggml_bf16_t)) {
+            continue;   // used in place
+        }
+
+        const bool    repacked = ggml_xdna_is_cpu_repack(&t);
+        const int64_t n_i02    = repacked ? 1 : t.ne[2];
+        const int64_t n_i03    = repacked ? 1 : t.ne[3];
+        const size_t  bytes    = (size_t) rows*n_k*sizeof(ggml_bf16_t);
+        for (int64_t i03 = 0; i03 < n_i03 && !st.warm_stop && !full; i03++) {
+            for (int64_t i02 = 0; i02 < n_i02 && !st.warm_stop && !full; i02++) {
+                const char * plane = (const char *) t.data + i02*t.nb[2] + i03*t.nb[3];
+                {
+                    std::lock_guard<std::mutex> lock(st.cache_mutex);
+                    if (st.npu_weights.count(plane) != 0) {
+                        continue;
+                    }
+                    if (st.npu_weight_bytes + bytes > ggml_xdna_npu_cache_limit()) {
+                        full = true;
+                        break;
+                    }
+                    st.npu_weight_bytes += bytes;   // reserved while converting
+                }
+
+                std::vector<ggml_bf16_t> data((size_t) rows*n_k);
+                ggml_xdna_weight_rows_to_bf16(&wctx, &t, 0, rows, i02, i03, data.data(), n_k);
+                const uint64_t sig = ggml_xdna_weight_sig(plane, n_feat*t.nb[1], t.type, n_k);
+
+                std::lock_guard<std::mutex> lock(st.cache_mutex);
+                auto ins = st.npu_weights.try_emplace(plane);
+                if (ins.second) {
+                    ins.first->second.data   = std::move(data);
+                    ins.first->second.n_rows = rows;
+                    ins.first->second.sig    = sig;
+                    n_weights++;
+                    n_bytes += bytes;
+                } else {
+                    st.npu_weight_bytes -= bytes;   // an op converted it first
+                }
+            }
+        }
+    }
+
+    if (n_weights > 0 || n_kernels > 0) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+        GGML_LOG_INFO("%s: loaded %d NPU kernel(s) and converted %d weight(s) (%.0f MB of bf16) in %.0f ms%s\n",
+                      __func__, n_kernels, n_weights, n_bytes/1048576.0, ms,
+                      full ? " (cache full)" : st.warm_stop ? " (stopped early: NPU in use or backend freed)" : "");
+    }
+}
+
+// supports_op admitted a MUL_MAT on this weight: queue it for the warm-up (once per weight)
+static void ggml_xdna_warm_enqueue(const ggml_tensor * src0, int64_t n_tok) {
+    ggml_xdna_state & st = ggml_xdna_get_state();
+    if (st.warm_stop) {
+        return;
+    }
+    // only weights backed by real memory: llama.cpp also builds graphs over a model loaded with
+    // no_alloc (e.g. to fit the context to memory), whose weights sit in a size-0 dummy buffer
+    // tagged as weights, with no data
+    const char * base = src0->buffer != nullptr ? (const char *) ggml_backend_buffer_get_base(src0->buffer) : nullptr;
+    const size_t size = src0->buffer != nullptr ? ggml_backend_buffer_get_size(src0->buffer) : 0;
+    if (src0->data == nullptr || base == nullptr || size < ggml_nbytes(src0) ||
+        (const char *) src0->data < base || (const char *) src0->data + ggml_nbytes(src0) > base + size) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(st.warm_mutex);
+    if (st.warm_stop || st.warm_share <= 0.0f || st.warm_seen.count(src0->data) != 0) {
+        return;
+    }
+    st.warm_seen[src0->data] = true;
+    st.warm_queue.push_back({ *src0, n_tok });
+    if (st.warm_running) {
+        st.warm_cv.notify_one();
+        return;
+    }
+    if (st.warm_thread.joinable()) {
+        st.warm_thread.join();   // a previous run that found its queue empty and has finished
+    }
+    st.warm_running = true;
+    st.warm_thread  = std::thread(ggml_xdna_warm_run);
+}
+
+// the share of each op's rows the NPU is expected to take, for the warm-up (0: no warm-up):
+// an explicit share, none next to a GPU worker, and about half with the auto split, which settles
+// between 0.3 and 0.5 on the 8700G (any rows beyond the warmed ones are converted on first use)
+static float ggml_xdna_warm_share(const ggml_backend_xdna_context * ctx) {
+    if (const char * env = ggml_xdna_getenv("GGML_XDNA_NPU_WARM")) {
+        if (std::atoi(env) == 0) {
+            return 0.0f;
+        }
+    }
+    if (ggml_xdna_npu_cache_limit() == 0) {
+        return 0.0f;
+    }
+    if (ctx->share_fixed) {
+        return ctx->share[GGML_XDNA_WORKER_NPU];
+    }
+    return ctx->vk != nullptr ? 0.0f : 0.5f;
+}
+
+static void ggml_xdna_warm_acquire(const ggml_backend_xdna_context * ctx) {
+    ggml_xdna_state & st = ggml_xdna_get_state();
+    const float share = ggml_xdna_warm_share(ctx);
+    std::lock_guard<std::mutex> lock(st.warm_mutex);
+    if (st.n_backends++ == 0) {
+        st.warm_share = share;
+        st.warm_stop  = share <= 0.0f;
+    }
+}
+
+// a backend is going away: when it is the last one, stop the warm-up and drop the shared cache
+// (the model's weights may be freed next)
+static void ggml_xdna_warm_release() {
+    ggml_xdna_state & st = ggml_xdna_get_state();
+    std::unique_lock<std::mutex> lock(st.warm_mutex);
+    if (--st.n_backends > 0) {
+        return;
+    }
+    st.warm_stop = true;
+    st.warm_cv.notify_all();
+    std::thread th = std::move(st.warm_thread);
+    lock.unlock();
+    if (th.joinable()) {
+        th.join();
+    }
+    lock.lock();
+    st.warm_running = false;
+    st.warm_queue.clear();
+    st.warm_seen.clear();
+    lock.unlock();
+
+    std::lock_guard<std::mutex> cache_lock(st.cache_mutex);
+    st.npu_weights.clear();
+    st.npu_weight_bytes = 0;
+}
+
 // shape key for the auto split; repacked and plain weights of the same shape run at different speeds
 static std::tuple<int64_t, int64_t, int> ggml_xdna_shape_key(const struct ggml_tensor * src0) {
     return std::make_tuple(src0->ne[1], src0->ne[0], (int) src0->type + (ggml_xdna_is_cpu_repack(src0) ? 1000 : 0));
@@ -1358,6 +1612,16 @@ static bool ggml_xdna_plan_auto(ggml_backend_xdna_context * ctx, ggml_xdna_state
             if (c == n_feat) {
                 break;
             }
+        }
+    }
+
+    // a worker left out is never measured again, so a single bad sample (a busy moment, some
+    // first-use cost) would keep the NPU off this shape for good: every 16th op without it, give
+    // it one block so its estimate can recover
+    if (best_c == 0 && kp != nullptr && npu_ms_per_row > 0.0 && it != ctx->shape_perf_map.end()) {
+        if (++it->second.npu_skips % 16 == 0) {
+            best_c = std::min(kp->M, n_feat);
+            best_t = std::max(t_npu(best_c), (n_feat - best_c)/rest_rate);
         }
     }
 
@@ -1490,9 +1754,15 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
 
     if (!ctx->share_fixed && vk_ok && cpu_ok) {
         // learn each worker's speed for this matrix shape (rows*tokens per ms) and overall (MACs per ms)
+        // the NPU's first run of a shape carries first-use costs, like a kernel load or conversion
+        // (npu_cold), so neither is learned from
         auto & sp = ctx->shape_perf_map[ggml_xdna_shape_key(src0)];
+        const bool npu_first = !sp.npu_seen;
+        if (n[GGML_XDNA_WORKER_NPU] > 0) {
+            sp.npu_seen = true;
+        }
         for (int i = 0; i < GGML_XDNA_N_WORKERS; i++) {
-            if (n[i] > 0 && t[i] > 0.0 && !(i == GGML_XDNA_WORKER_NPU && ctx->npu_cold)) {
+            if (n[i] > 0 && t[i] > 0.0 && !(i == GGML_XDNA_WORKER_NPU && (ctx->npu_cold || npu_first))) {
                 const double thr = (double) n[i]*ne11/(t[i]*1e3);
                 sp.thr[i]       = sp.thr[i]       > 0.0 ? 0.7*sp.thr[i]       + 0.3*thr      : thr;
                 ctx->mac_thr[i] = ctx->mac_thr[i] > 0.0 ? 0.9*ctx->mac_thr[i] + 0.1*thr*ne00 : thr*ne00;
@@ -1524,6 +1794,7 @@ static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_xdna_free(ggml_backend_t backend) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
+    ggml_xdna_warm_release();
     if (ctx->cpu) {
         ggml_backend_free(ctx->cpu);
     }
@@ -1601,7 +1872,9 @@ static ggml_guid_t ggml_backend_xdna_guid(void) {
 ggml_backend_t ggml_backend_xdna_init(void) {
     ggml_xdna_probe(ggml_xdna_get_state());
 
-    ggml_backend_xdna_context * ctx = new ggml_backend_xdna_context;   // shares resolved on first use
+    ggml_backend_xdna_context * ctx = new ggml_backend_xdna_context;
+    ggml_xdna_init_shares(ctx);    // creates the workers now, so the warm-up knows the NPU's share
+    ggml_xdna_warm_acquire(ctx);
 
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_xdna_guid(),
@@ -1732,6 +2005,10 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                    (!ggml_xdna_is_cpu_repack(src0) ||
                     (ggml_xdna_repack_enabled() && ggml_n_dims(src0) == 2 && n_feat % 8 == 0 &&
                      ((src0->type == GGML_TYPE_Q4_0 && n_k % 32 == 0) || (src0->type == GGML_TYPE_Q4_K && n_k % 256 == 0))));
+
+            if (ok && ggml_xdna_is_weight(src0)) {
+                ggml_xdna_warm_enqueue(src0, n_tok);
+            }
 
             // the scheduler asks again on every graph build: log each distinct decision once, so that
             // debug runs are not slowed down by thousands of repeated lines
