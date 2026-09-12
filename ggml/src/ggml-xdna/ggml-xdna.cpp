@@ -1733,8 +1733,17 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                     (ggml_xdna_repack_enabled() && ggml_n_dims(src0) == 2 && n_feat % 8 == 0 &&
                      ((src0->type == GGML_TYPE_Q4_0 && n_k % 32 == 0) || (src0->type == GGML_TYPE_Q4_K && n_k % 256 == 0))));
 
-            const bool debug = ggml_xdna_debug();
-            if (debug) {
+            // the scheduler asks again on every graph build: log each distinct decision once, so that
+            // debug runs are not slowed down by thousands of repeated lines
+            static std::mutex logged_mutex;
+            static std::map<std::tuple<int, int, int64_t, int64_t, int64_t, int, bool>, bool> logged;
+            bool log_it = false;
+            if (ggml_xdna_debug()) {
+                std::lock_guard<std::mutex> lock(logged_mutex);
+                log_it = logged.emplace(std::make_tuple((int) src0->type, (int) ggml_xdna_is_cpu_repack(src0), n_k, n_feat, n_tok,
+                                                        ggml_is_contiguous(src0) + 2*ggml_is_contiguous(src1), ok), true).second;
+            }
+            if (log_it) {
                 GGML_LOG_INFO("%s: MUL_MAT %s[%" PRId64 ",%" PRId64 "] x %s[%" PRId64 ",%" PRId64 "] -> %s cont=%d/%d min_batch=%" PRId64 " : %s\n",
                               __func__, ggml_type_name(src0->type), n_k, n_feat, ggml_type_name(src1->type), src1->ne[0], n_tok,
                               ggml_type_name(op->type), ggml_is_contiguous(src0), ggml_is_contiguous(src1), st.min_batch,

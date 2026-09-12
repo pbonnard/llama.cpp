@@ -897,8 +897,12 @@ Usage notes:
   Measured on a Ryzen 7 8700G (CPU+NPU build, `-nr`, ~476-token prompt, 8 threads, median of 5):
   Qwen3-0.6B Q4_0 — CPU only 398 t/s, NPU only 380, CPU+NPU 518 with the `auto` default (474 at 0.4);
   gemma-4-E2B Q4_K_M — CPU only 125, NPU only 105, CPU+NPU 162 with `auto` (164 at 0.4). The stock repacked
-  CPU path is still faster (582 / 217 t/s); with repacked weights (no `-nr`) CPU+NPU ties it
-  (Qwen3-0.6B Q4_0 590 vs 581 t/s, gemma-4-E2B Q4_K_M 210 vs 213). Decode is unchanged.
+  CPU path is still faster (582 / 217 t/s); with repacked weights (no `-nr`) CPU+NPU beats it once
+  the NPU's bf16 weight cache is warm (`llama-bench -p 512 -r 5`: Qwen3-0.6B Q4_0 754 vs 642 t/s,
+  gemma-4-E2B Q4_K_M 262 vs 225) and ties it on a single cold prompt (590 vs 581, 210 vs 213),
+  which pays the kernel loads and weight conversion. With the NPU's share at 0 the XDNA path costs
+  ~3% on Qwen3-0.6B (an extra graph split per matmul) and nothing measurable on gemma-4-E2B.
+  Decode is unchanged.
 - The scheduler-level combination also works: with `-ngl N` the first N layers live on the Vulkan
   device and the remaining layers' prompt matmuls go through the XDNA backend (and its workers).
 - The NPU's blocks are pipelined (the host stages the next block while the NPU computes the current

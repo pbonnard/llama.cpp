@@ -71,8 +71,9 @@ Token generation speed is the same in every configuration (~90 tokens/s for Qwen
   faster in the same conditions (311 → 365 tokens/s on Qwen3-0.6B, 77 → 97 on gemma-4-E2B).
 - The stock CPU path, with its repacked weights, is still faster than CPU + NPU on plain weights (~12% ahead on
   Qwen3-0.6B, ~34% on gemma-4-E2B). The backend can now also split matrix multiplies on the CPU's repacked Q4_0
-  and Q4_K weights, with no `--no-repack` needed: that ties the stock path (Qwen3-0.6B 590 vs 581 tokens/s,
-  gemma-4-E2B 210 vs 213). The repacked
+  and Q4_K weights, with no `--no-repack` needed. Once the NPU's weight cache is warm that beats the stock path by
+  16–17% (`llama-bench -p 512`, 8 threads: Qwen3-0.6B 754 vs 642 tokens/s, gemma-4-E2B 262 vs 225); a single cold
+  prompt only ties it (590 vs 581, 210 vs 213). The repacked
   CPU kernels are about twice as fast per row as the NPU, and 512-row NPU blocks can't give the NPU the ~1/3 it would
   need on 1024-row matrices.
 - The 780M is roughly 10× faster than the XDNA1 at batched matrix multiply. Next to it the NPU only makes each
@@ -125,8 +126,9 @@ More detail is in the [XDNA section of docs/build.md](docs/build.md#xdna-amd-ryz
   `GGML_XDNA_NPU_CACHE_MB` the weights are converted on every call.
 - Of the CPU backend's repacked weight layouts only Q4_0 and Q4_K are understood so far; other repacked types stay
   on the CPU unless you run with `--no-repack`.
-- Going through the backend costs about 13% even with the NPU's share at 0 (gemma-4-E2B, repacked weights); the
-  private CPU worker's threading is the main suspect.
+- The NPU's bf16 weights are converted, and its kernels loaded, on first use, so the first long prompt only ties
+  the CPU; later prompts get the full gain. Routing matrix multiplies through the backend costs ~3% on a small
+  model such as Qwen3-0.6B (one extra graph split per operation) and nothing measurable on gemma-4-E2B.
 - NPU blocks are pipelined within an operation, but each operation waits for all of its workers before the graph
   moves on.
 - There are only bf16 kernels. Integer kernels that match the quantized weight formats would suit the NPU better.
