@@ -931,6 +931,17 @@ Usage notes:
   the NPU and either int8 weights in a 5 GB cache or bf16 weights in a 10 GB one; with the
   default 4 GB bf16 cache the NPU adds nothing. On a machine without a page file, keep the
   cache well below free RAM: the 10 GB runs left no free memory, the 5 GB int8 run 4 GB.
+- Mixture-of-experts layers (`MUL_MAT_ID`, e.g. Mixtral) are split the same way during prompt
+  processing when the NPU takes part (not next to a GPU worker with the NPU at 0). The NPU
+  computes the first rows of every expert: the tokens routed to each expert are gathered and
+  multiplied by that expert's rows as one NPU product. The CPU backend computes the other rows of
+  every expert as one `MUL_MAT_ID` over views, at the same time. The auto split models the NPU
+  from each expert's block count (its tokens are padded to the kernel's 64-256-token blocks) and
+  corrects the model by measurement. Expert weights are not warmed at load: they are most of an
+  MoE model's weights and rarely fit the cache. Mixtral 8x7B Q4_0 (`llama-bench -p 512 -r 3`):
+  18.0 vs 14.0 t/s on the CPU alone, KL divergence 0.0025 against the CPU (NPU on all rows:
+  0.0026). On Windows the weight cache also stops growing when less than 2 GB of commit would be
+  left, and an NPU worker that fails (e.g. out of memory) hands its rows to the CPU.
 - `GGML_XDNA_DEBUG=1` logs every `supports_op` decision; `GGML_XDNA_MIN_BATCH=<n>` raises the token
   threshold (a very large value disables NPU use without rebuilding). `GGML_XDNA_DISABLE=1` removes
   the device altogether without opening the NPU (useful for `--version` / `--list-devices` side

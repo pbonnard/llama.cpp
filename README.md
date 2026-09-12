@@ -77,7 +77,9 @@ Token generation speed is the same in every configuration (~90 tokens/s for Qwen
   first request is already faster than the CPU alone (Qwen3-0.6B 615–708 vs 544–592, gemma-4-E2B 229–260 vs 202–224).
 - Large models need the NPU's weights to fit its cache. On qwen3.8:27b Q4_K_M, int8 weights (`GGML_XDNA_NPU_W8=1`)
   in a 5 GB cache prefill at ~19.8 tokens/s against ~17.4 on the CPU alone (+14%); bf16 weights need 10 GB for the
-  same, and the default 4 GB bf16 cache adds nothing. The repacked
+  same, and the default 4 GB bf16 cache adds nothing.
+- Mixture-of-experts layers go through the NPU too: Mixtral 8x7B Q4_0 processes prompts at 18.0 tokens/s against 14.0
+  on the CPU alone (+29%, `llama-bench -p 512`), with a KL divergence of 0.0025 from the CPU's results. The repacked
   CPU kernels are about twice as fast per row as the NPU, and 512-row NPU blocks can't give the NPU the ~1/3 it would
   need on 1024-row matrices.
 - The 780M is roughly 10× faster than the XDNA1 at batched matrix multiply. Next to it the NPU only makes each
