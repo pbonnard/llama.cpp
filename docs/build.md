@@ -865,9 +865,11 @@ kernel location.
 Usage notes:
 
 - The backend is picked up automatically as an accelerator device (`XDNA` in `--list-devices`).
-- The CPU backend's weight repacking puts quantized weights into CPU-only buffers that other
-  backends cannot see, so run with `--no-repack` (`-nr`) for the NPU to receive those matmuls;
-  weights in plain host buffers (non-repacked types, `-nr`) are routed to it without further setup.
+- Weights the CPU backend repacks for its SIMD kernels (`CPU_REPACK` buffers) are split too when the
+  layout is supported (currently Q4_0, x86 only): the NPU converts its rows back to bf16 once, and
+  the CPU worker keeps using the repacked kernels. Other repacked types stay on the CPU;
+  `--no-repack` (`-nr`) routes every quantized type through plain host buffers instead, and
+  `GGML_XDNA_REPACK=0` turns the repacked path off.
 - Each matmul the backend receives is split by output features between the NPU, a private Vulkan
   backend on the integrated GPU (when llama.cpp is built with `GGML_VULKAN=ON` as well; the AMD
   device is picked automatically, `GGML_XDNA_VK_DEVICE=<n>` overrides) and a private CPU backend,
@@ -895,7 +897,8 @@ Usage notes:
   Measured on a Ryzen 7 8700G (CPU+NPU build, `-nr`, ~476-token prompt, 8 threads, median of 5):
   Qwen3-0.6B Q4_0 — CPU only 398 t/s, NPU only 380, CPU+NPU 518 with the `auto` default (474 at 0.4);
   gemma-4-E2B Q4_K_M — CPU only 125, NPU only 105, CPU+NPU 162 with `auto` (164 at 0.4). The stock repacked
-  CPU path, which the NPU cannot join yet, is still faster (582 / 217 t/s). Decode is unchanged.
+  CPU path is still faster (582 / 217 t/s); with repacked Q4_0 weights (no `-nr`) CPU+NPU ties it on
+  Qwen3-0.6B (570 vs 580 t/s). Decode is unchanged.
 - The scheduler-level combination also works: with `-ngl N` the first N layers live on the Vulkan
   device and the remaining layers' prompt matmuls go through the XDNA backend (and its workers).
 - The NPU's blocks are pipelined (the host stages the next block while the NPU computes the current

@@ -125,6 +125,29 @@ static bool ggml_xdna_debug() {
     return debug;
 }
 
+// the CPU backend's repack buffer holds weights re-laid out for its SIMD kernels; its buffer type
+// is internal to ggml-cpu, so it is recognized by name
+static bool ggml_xdna_buft_is_cpu_repack(ggml_backend_buffer_type_t buft) {
+    return std::strcmp(ggml_backend_buft_name(buft), "CPU_REPACK") == 0;
+}
+
+static bool ggml_xdna_is_cpu_repack(const ggml_tensor * t) {
+    return t->buffer != nullptr && ggml_xdna_buft_is_cpu_repack(ggml_backend_buffer_get_type(t->buffer));
+}
+
+// whether matmuls on repacked weights may be taken (GGML_XDNA_REPACK=0 leaves them to the CPU)
+static bool ggml_xdna_repack_enabled() {
+#if !(defined(__x86_64__) || defined(_M_X64))
+    return false;   // the layout converters below follow the x86 (AVX2) repack formats
+#else
+    static const bool enabled = [] {
+        const char * v = ggml_xdna_getenv("GGML_XDNA_REPACK");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return enabled;
+#endif
+}
+
 static void ggml_xdna_scan_kernels(ggml_xdna_state & st, const std::string & dir) {
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) {
@@ -804,6 +827,12 @@ static bool ggml_xdna_mul_mat_cpu(ggml_backend_xdna_context * ctx, struct ggml_t
     ggml_tensor * a = ggml_new_tensor_4d(gctx, src0->type, src0->ne[0], feat1 - feat0, src0->ne[2], src0->ne[3]);
     a->data = (char *) src0->data + feat0*src0->nb[1];
     std::memcpy(a->nb, src0->nb, sizeof(a->nb));
+    if (ggml_xdna_is_cpu_repack(src0)) {
+        // keep the CPU's repacked kernels: they pick the layout from the weight's buffer type and
+        // extra traits, and a slice starting on an 8-row group is itself a valid repacked tensor
+        a->buffer = src0->buffer;
+        a->extra  = src0->extra;
+    }
 
     ggml_tensor * b = ggml_new_tensor_4d(gctx, src1->type, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
     b->data = src1->data;
@@ -878,6 +907,57 @@ static void ggml_xdna_rows_to_bf16(ggml_backend_xdna_context * ctx, const ggml_t
     });
 }
 
+// CPU_REPACK Q4_0 layout on x86 (block_q4_0x8, see make_block_q4_0x8 in ggml-cpu/repack.cpp): each
+// group of 8 rows is stored as one block_q4_0x8 per 32-wide column block, holding the 8 rows'
+// scales and their quants interleaved in 8-byte chunks, xor 0x88
+struct ggml_xdna_block_q4_0   { ggml_fp16_t d;    uint8_t qs[16];  };
+struct ggml_xdna_block_q4_0x8 { ggml_fp16_t d[8]; uint8_t qs[128]; };
+static_assert(sizeof(ggml_xdna_block_q4_0)   == 18,  "unexpected block_q4_0 size");
+static_assert(sizeof(ggml_xdna_block_q4_0x8) == 144, "unexpected block_q4_0x8 size");
+
+// convert rows [row0, row0 + n_rows) (multiples of 8) of a CPU_REPACK Q4_0 tensor to bf16
+static void ggml_xdna_repacked_q4_0_rows_to_bf16(ggml_backend_xdna_context * ctx, const ggml_tensor * t,
+                                                 int64_t row0, int64_t n_rows, ggml_bf16_t * dst, int64_t dst_stride) {
+    const int64_t ne0     = t->ne[0];
+    const int64_t nblocks = ne0/32;
+    const ggml_to_float_t to_float = ggml_get_type_traits(GGML_TYPE_Q4_0)->to_float;
+
+    ggml_xdna_parallel_for(ctx, n_rows/8, 2, [&](int64_t g0, int64_t g1) {
+        std::vector<ggml_xdna_block_q4_0> rows(8*nblocks);   // the group's 8 rows as plain q4_0
+        std::vector<float> tmp(ne0);
+        for (int64_t g = g0; g < g1; g++) {
+            const auto * src = (const ggml_xdna_block_q4_0x8 *) ((const char *) t->data + (row0 + 8*g)*t->nb[1]);
+            for (int64_t x = 0; x < nblocks; x++) {
+                for (int r = 0; r < 8; r++) {
+                    rows[r*nblocks + x].d = src[x].d[r];
+                }
+                for (int c = 0; c < 16; c++) {
+                    uint64_t q;
+                    std::memcpy(&q, &src[x].qs[8*c], sizeof(q));
+                    q ^= 0x8888888888888888ULL;
+                    std::memcpy(&rows[(c % 8)*nblocks + x].qs[8*(c / 8)], &q, sizeof(q));
+                }
+            }
+            for (int r = 0; r < 8; r++) {
+                to_float(&rows[r*nblocks], tmp.data(), ne0);
+                ggml_fp32_to_bf16_row(tmp.data(), dst + (8*g + r)*dst_stride, ne0);
+            }
+        }
+    });
+}
+
+// weight rows of src0, plain or CPU_REPACK, to bf16
+static void ggml_xdna_weight_rows_to_bf16(ggml_backend_xdna_context * ctx, const ggml_tensor * src0,
+                                          int64_t row0, int64_t n_rows, int64_t i02, int64_t i03,
+                                          ggml_bf16_t * dst, int64_t dst_stride) {
+    if (ggml_xdna_is_cpu_repack(src0)) {
+        GGML_ASSERT(src0->type == GGML_TYPE_Q4_0 && row0 % 8 == 0 && n_rows % 8 == 0 && i02 == 0 && i03 == 0);
+        ggml_xdna_repacked_q4_0_rows_to_bf16(ctx, src0, row0, n_rows, dst, dst_stride);
+        return;
+    }
+    ggml_xdna_rows_to_bf16(ctx, src0, row0, n_rows, i02, i03, dst, dst_stride);
+}
+
 // copy an [n_rows x n_cols] window of a bf16 row-major matrix into a zero-padded [rows x cols] block
 static void ggml_xdna_fill_block(ggml_bf16_t * blk, int64_t rows, int64_t cols,
                                  const ggml_bf16_t * src, int64_t src_stride, int64_t n_rows, int64_t n_cols) {
@@ -938,7 +1018,7 @@ static const ggml_bf16_t * ggml_xdna_npu_weights(ggml_backend_xdna_context * ctx
             auto & w = ctx->npu_weights[key];
             w.data.resize((size_t) n_rows*n_k);
             w.sig = sig;
-            ggml_xdna_rows_to_bf16(ctx, src0, row0, n_rows, i02, i03, w.data.data(), n_k);
+            ggml_xdna_weight_rows_to_bf16(ctx, src0, row0, n_rows, i02, i03, w.data.data(), n_k);
             ctx->npu_weight_bytes += bytes;
             return w.data.data();
         }
@@ -947,7 +1027,7 @@ static const ggml_bf16_t * ggml_xdna_npu_weights(ggml_backend_xdna_context * ctx
     if ((int64_t) ctx->w_bf16.size() < n_rows*n_k) {
         ctx->w_bf16.resize(n_rows*n_k);
     }
-    ggml_xdna_rows_to_bf16(ctx, src0, row0, n_rows, i02, i03, ctx->w_bf16.data(), n_k);
+    ggml_xdna_weight_rows_to_bf16(ctx, src0, row0, n_rows, i02, i03, ctx->w_bf16.data(), n_k);
     return ctx->w_bf16.data();
 }
 
@@ -1091,6 +1171,11 @@ static void ggml_xdna_mul_mat_npu(ggml_backend_xdna_context * ctx, struct ggml_t
     }
 }
 
+// shape key for the auto split; repacked and plain weights of the same shape run at different speeds
+static std::tuple<int64_t, int64_t, int> ggml_xdna_shape_key(const struct ggml_tensor * src0) {
+    return std::make_tuple(src0->ne[1], src0->ne[0], (int) src0->type + (ggml_xdna_is_cpu_repack(src0) ? 1000 : 0));
+}
+
 // auto split: choose how many rows each worker gets by predicted finish time. The NPU takes whole
 // kernel blocks (none, some, or all rows); the rest is shared by the Vulkan and CPU workers in
 // proportion to their speed. Speeds are learned per matrix shape; for a shape not seen yet the NPU
@@ -1104,10 +1189,11 @@ static bool ggml_xdna_plan_auto(ggml_backend_xdna_context * ctx, ggml_xdna_state
     const int64_t n_k    = src0->ne[0];
     const int64_t n_tok  = dst->src[1]->ne[1];
 
-    const bool vk_on  = ctx->vk  != nullptr && ctx->share[GGML_XDNA_WORKER_VK]  > 0.0f;
+    // the Vulkan worker cannot read the CPU's repacked layout
+    const bool vk_on  = ctx->vk  != nullptr && ctx->share[GGML_XDNA_WORKER_VK]  > 0.0f && !ggml_xdna_is_cpu_repack(src0);
     const bool cpu_on = ctx->cpu != nullptr && ctx->share[GGML_XDNA_WORKER_CPU] > 0.0f;
 
-    const auto     it  = ctx->shape_perf_map.find(std::make_tuple(n_feat, n_k, (int) src0->type));
+    const auto     it  = ctx->shape_perf_map.find(ggml_xdna_shape_key(src0));
     const double * thr = it != ctx->shape_perf_map.end() ? it->second.thr : nullptr;
 
     // ms per row on worker i, or -1 if it has never been measured
@@ -1227,7 +1313,7 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
                 n[GGML_XDNA_WORKER_NPU] = n_feat;
             }
         }
-        if (ctx->vk && ctx->share[GGML_XDNA_WORKER_VK] > 0.0f) {
+        if (ctx->vk && ctx->share[GGML_XDNA_WORKER_VK] > 0.0f && !ggml_xdna_is_cpu_repack(src0)) {
             n[GGML_XDNA_WORKER_VK] = (int64_t) (n_feat*ctx->share[GGML_XDNA_WORKER_VK] + 32) / 64 * 64;
             n[GGML_XDNA_WORKER_VK] = std::min(n[GGML_XDNA_WORKER_VK], n_feat - n[GGML_XDNA_WORKER_NPU]);
         }
@@ -1284,7 +1370,7 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
 
     if (!ctx->share_fixed && vk_ok && cpu_ok) {
         // learn each worker's speed for this matrix shape (rows*tokens per ms) and overall (MACs per ms)
-        auto & sp = ctx->shape_perf_map[std::make_tuple(n_feat, ne00, (int) src0->type)];
+        auto & sp = ctx->shape_perf_map[ggml_xdna_shape_key(src0)];
         for (int i = 0; i < GGML_XDNA_N_WORKERS; i++) {
             if (n[i] > 0 && t[i] > 0.0 && !(i == GGML_XDNA_WORKER_NPU && ctx->npu_cold)) {
                 const double thr = (double) n[i]*ne11/(t[i]*1e3);
@@ -1518,7 +1604,11 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                    op->type   == GGML_TYPE_F32 &&
                    (n_tok >= st.min_batch && n_k >= min_dim && n_feat >= min_dim) &&
                    (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 ||
-                    ggml_get_type_traits(src0->type)->to_float != NULL);
+                    ggml_get_type_traits(src0->type)->to_float != NULL) &&
+                   // repacked weights: only the layout the NPU side can convert back (Q4_0, 8-row groups)
+                   (!ggml_xdna_is_cpu_repack(src0) ||
+                    (ggml_xdna_repack_enabled() && src0->type == GGML_TYPE_Q4_0 && ggml_n_dims(src0) == 2 &&
+                     n_feat % 8 == 0 && n_k % 32 == 0));
 
             const bool debug = ggml_xdna_debug();
             if (debug) {
@@ -1538,7 +1628,8 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
 }
 
 static bool ggml_backend_xdna_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
+    // repacked weights are readable too: the NPU converts its rows back, the CPU worker keeps them
+    return ggml_backend_buft_is_host(buft) || (ggml_xdna_repack_enabled() && ggml_xdna_buft_is_cpu_repack(buft));
 
     GGML_UNUSED(dev);
 }

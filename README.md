@@ -69,8 +69,11 @@ Token generation speed is the same in every configuration (~90 tokens/s for Qwen
   gemma-4-E2B at NPU shares 0.3–0.5 or `auto`. `auto` is the fastest on Qwen3-0.6B and ties the best fixed share on
   gemma-4-E2B, without tuning per model. Pipelining the NPU blocks and caching bf16 weights made the NPU alone 17–26%
   faster in the same conditions (311 → 365 tokens/s on Qwen3-0.6B, 77 → 97 on gemma-4-E2B).
-- The stock CPU path is still faster overall (~12% ahead on Qwen3-0.6B, ~34% on gemma-4-E2B). Its repacked weight
-  layout is invisible to other backends, so the NPU can only take part with `--no-repack`.
+- The stock CPU path, with its repacked weights, is still faster than CPU + NPU on plain weights (~12% ahead on
+  Qwen3-0.6B, ~34% on gemma-4-E2B). The backend can now also split matrix multiplies on the CPU's repacked Q4_0
+  weights, with no `--no-repack` needed: on Qwen3-0.6B that ties the stock path (570 vs 580 tokens/s). The repacked
+  CPU kernels are about twice as fast per row as the NPU, and 512-row NPU blocks can't give the NPU the ~1/3 it would
+  need on 1024-row matrices.
 - The 780M is roughly 10× faster than the XDNA1 at batched matrix multiply. Next to it the NPU only makes each
   operation finish later, so it is off by default when a Vulkan worker is available.
 - On an APU, keeping the whole model on the integrated GPU is by far the fastest option when it fits in memory.
@@ -95,7 +98,8 @@ tested.
 ## Running
 
 ```sh
-llama-cli -m model.gguf --no-repack   # --no-repack lets the NPU receive the prompt matrix multiplies
+llama-cli -m model.gguf               # plain and repacked Q4_0 weights are split between CPU and NPU
+llama-cli -m model.gguf --no-repack   # routes every quantized type through plain buffers the NPU can read
 ```
 
 | variable | effect |
@@ -105,6 +109,7 @@ llama-cli -m model.gguf --no-repack   # --no-repack lets the NPU receive the pro
 | `GGML_XDNA_MIN_BATCH` | smallest token count sent to the backend (default 32) |
 | `GGML_XDNA_NPU_MIN_GFLOP` | with a Vulkan worker, the NPU only takes operations at least this large (default 4) |
 | `GGML_XDNA_NPU_CACHE_MB` | memory for the NPU's cached bf16 weights (default 4096); `0` converts weights on every call |
+| `GGML_XDNA_REPACK` | `0` leaves matrix multiplies on the CPU's repacked weights to the CPU (default: split them too) |
 | `GGML_XDNA_VK_DEVICE` | Vulkan device used by the worker (default: the first AMD device) |
 | `GGML_XDNA_KERNEL_DIR` | directory with the NPU kernels |
 | `GGML_XDNA_DEBUG` | set to `1` to log routing decisions |
@@ -116,7 +121,8 @@ More detail is in the [XDNA section of docs/build.md](docs/build.md#xdna-amd-ryz
 
 - The bf16 weight cache costs 2 bytes per cached weight (the NPU's share of the model's matrices); past
   `GGML_XDNA_NPU_CACHE_MB` the weights are converted on every call.
-- The backend cannot read the CPU backend's repacked weight layouts yet, which is why `--no-repack` is needed.
+- Of the CPU backend's repacked weight layouts only Q4_0 is understood so far; other repacked types stay on the CPU
+  unless you run with `--no-repack`.
 - NPU blocks are pipelined within an operation, but each operation waits for all of its workers before the graph
   moves on.
 - There are only bf16 kernels. Integer kernels that match the quantized weight formats would suit the NPU better.
