@@ -71,7 +71,8 @@ Token generation speed is the same in every configuration (~90 tokens/s for Qwen
   faster in the same conditions (311 → 365 tokens/s on Qwen3-0.6B, 77 → 97 on gemma-4-E2B).
 - The stock CPU path, with its repacked weights, is still faster than CPU + NPU on plain weights (~12% ahead on
   Qwen3-0.6B, ~34% on gemma-4-E2B). The backend can now also split matrix multiplies on the CPU's repacked Q4_0
-  weights, with no `--no-repack` needed: on Qwen3-0.6B that ties the stock path (570 vs 580 tokens/s). The repacked
+  and Q4_K weights, with no `--no-repack` needed: that ties the stock path (Qwen3-0.6B 590 vs 581 tokens/s,
+  gemma-4-E2B 210 vs 213). The repacked
   CPU kernels are about twice as fast per row as the NPU, and 512-row NPU blocks can't give the NPU the ~1/3 it would
   need on 1024-row matrices.
 - The 780M is roughly 10× faster than the XDNA1 at batched matrix multiply. Next to it the NPU only makes each
@@ -98,7 +99,7 @@ tested.
 ## Running
 
 ```sh
-llama-cli -m model.gguf               # plain and repacked Q4_0 weights are split between CPU and NPU
+llama-cli -m model.gguf               # plain and repacked Q4_0 / Q4_K weights are split between CPU and NPU
 llama-cli -m model.gguf --no-repack   # routes every quantized type through plain buffers the NPU can read
 ```
 
@@ -113,6 +114,7 @@ llama-cli -m model.gguf --no-repack   # routes every quantized type through plai
 | `GGML_XDNA_VK_DEVICE` | Vulkan device used by the worker (default: the first AMD device) |
 | `GGML_XDNA_KERNEL_DIR` | directory with the NPU kernels |
 | `GGML_XDNA_DEBUG` | set to `1` to log routing decisions |
+| `GGML_XDNA_DISABLE` | set to `1` to hide the backend entirely (no device, the NPU is not opened), e.g. for side processes |
 
 More detail is in the [XDNA section of docs/build.md](docs/build.md#xdna-amd-ryzen-ai-npu) and the
 [kernels README](ggml/src/ggml-xdna/kernels/README.md).
@@ -121,8 +123,10 @@ More detail is in the [XDNA section of docs/build.md](docs/build.md#xdna-amd-ryz
 
 - The bf16 weight cache costs 2 bytes per cached weight (the NPU's share of the model's matrices); past
   `GGML_XDNA_NPU_CACHE_MB` the weights are converted on every call.
-- Of the CPU backend's repacked weight layouts only Q4_0 is understood so far; other repacked types stay on the CPU
-  unless you run with `--no-repack`.
+- Of the CPU backend's repacked weight layouts only Q4_0 and Q4_K are understood so far; other repacked types stay
+  on the CPU unless you run with `--no-repack`.
+- Going through the backend costs about 13% even with the NPU's share at 0 (gemma-4-E2B, repacked weights); the
+  private CPU worker's threading is the main suspect.
 - NPU blocks are pipelined within an operation, but each operation waits for all of its workers before the graph
   moves on.
 - There are only bf16 kernels. Integer kernels that match the quantized weight formats would suit the NPU better.

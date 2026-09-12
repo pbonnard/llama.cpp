@@ -866,7 +866,7 @@ Usage notes:
 
 - The backend is picked up automatically as an accelerator device (`XDNA` in `--list-devices`).
 - Weights the CPU backend repacks for its SIMD kernels (`CPU_REPACK` buffers) are split too when the
-  layout is supported (currently Q4_0, x86 only): the NPU converts its rows back to bf16 once, and
+  layout is supported (currently Q4_0 and Q4_K, x86 only): the NPU converts its rows back to bf16 once, and
   the CPU worker keeps using the repacked kernels. Other repacked types stay on the CPU;
   `--no-repack` (`-nr`) routes every quantized type through plain host buffers instead, and
   `GGML_XDNA_REPACK=0` turns the repacked path off.
@@ -897,8 +897,8 @@ Usage notes:
   Measured on a Ryzen 7 8700G (CPU+NPU build, `-nr`, ~476-token prompt, 8 threads, median of 5):
   Qwen3-0.6B Q4_0 — CPU only 398 t/s, NPU only 380, CPU+NPU 518 with the `auto` default (474 at 0.4);
   gemma-4-E2B Q4_K_M — CPU only 125, NPU only 105, CPU+NPU 162 with `auto` (164 at 0.4). The stock repacked
-  CPU path is still faster (582 / 217 t/s); with repacked Q4_0 weights (no `-nr`) CPU+NPU ties it on
-  Qwen3-0.6B (570 vs 580 t/s). Decode is unchanged.
+  CPU path is still faster (582 / 217 t/s); with repacked weights (no `-nr`) CPU+NPU ties it
+  (Qwen3-0.6B Q4_0 590 vs 581 t/s, gemma-4-E2B Q4_K_M 210 vs 213). Decode is unchanged.
 - The scheduler-level combination also works: with `-ngl N` the first N layers live on the Vulkan
   device and the remaining layers' prompt matmuls go through the XDNA backend (and its workers).
 - The NPU's blocks are pipelined (the host stages the next block while the NPU computes the current
@@ -906,7 +906,11 @@ Usage notes:
   `GGML_XDNA_NPU_CACHE_MB` (default 4096; `0` converts on every call). Only tensors in model-weight
   buffers are cached by either the NPU or the Vulkan worker.
 - `GGML_XDNA_DEBUG=1` logs every `supports_op` decision; `GGML_XDNA_MIN_BATCH=<n>` raises the token
-  threshold (a very large value disables NPU use without rebuilding).
+  threshold (a very large value disables NPU use without rebuilding). `GGML_XDNA_DISABLE=1` removes
+  the device altogether without opening the NPU (useful for `--version` / `--list-devices` side
+  processes next to a server that owns the NPU).
+- The Vulkan worker writes its rows into a contiguous imported scratch buffer and copies them into
+  the destination, because the Vulkan backend's split-k matmul path requires a contiguous result.
 - The first-generation NPU is a low-power part: its dense bf16 GEMM throughput (~0.2 TFLOPS on 4
   columns) is below what the 8 Zen 4 cores reach on quantized weights, so expect the CPU+NPU split
   to trade some prompt-processing speed for offloaded work rather than to beat the CPU outright.
