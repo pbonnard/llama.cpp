@@ -74,7 +74,10 @@ Token generation speed is the same in every configuration (~90 tokens/s for Qwen
   and Q4_K weights, with no `--no-repack` needed. With the NPU's weight cache warm that beats the stock path by
   about a quarter to a third (`llama-bench -p 512 -r 5`, 8 threads: Qwen3-0.6B ~800 vs ~600 tokens/s, gemma-4-E2B
   ~270 vs ~218). The NPU's kernels and weights are prepared in the background while the model loads, so a server's
-  first request is already faster than the CPU alone (Qwen3-0.6B 615–708 vs 544–592, gemma-4-E2B 229–260 vs 202–224). The repacked
+  first request is already faster than the CPU alone (Qwen3-0.6B 615–708 vs 544–592, gemma-4-E2B 229–260 vs 202–224).
+- Large models need the NPU's weights to fit its cache. On qwen3.8:27b Q4_K_M, int8 weights (`GGML_XDNA_NPU_W8=1`)
+  in a 5 GB cache prefill at ~19.8 tokens/s against ~17.4 on the CPU alone (+14%); bf16 weights need 10 GB for the
+  same, and the default 4 GB bf16 cache adds nothing. The repacked
   CPU kernels are about twice as fast per row as the NPU, and 512-row NPU blocks can't give the NPU the ~1/3 it would
   need on 1024-row matrices.
 - The 780M is roughly 10× faster than the XDNA1 at batched matrix multiply. Next to it the NPU only makes each
@@ -112,6 +115,7 @@ llama-cli -m model.gguf --no-repack   # routes every quantized type through plai
 | `GGML_XDNA_MIN_BATCH` | smallest token count sent to the backend (default 32) |
 | `GGML_XDNA_NPU_MIN_GFLOP` | with a Vulkan worker, the NPU only takes operations at least this large (default 4) |
 | `GGML_XDNA_NPU_CACHE_MB` | memory for the NPU's cached bf16 weights (default 4096); `0` converts weights on every call |
+| `GGML_XDNA_NPU_W8` | `1` makes the NPU read model weights as int8 (one scale per row and 1,024 weights) with the `mm_w8_*` kernels: half the cache memory and copy traffic of bf16, at a small accuracy cost (default: bf16) |
 | `GGML_XDNA_NPU_WARM` | `0` turns off the load-time warm-up (default: load the NPU's kernels and convert its weights in the background while the model loads) |
 | `GGML_XDNA_REPACK` | `0` leaves matrix multiplies on the CPU's repacked weights to the CPU (default: split them too) |
 | `GGML_XDNA_VK_DEVICE` | Vulkan device used by the worker (default: the first AMD device) |
@@ -124,8 +128,9 @@ More detail is in the [XDNA section of docs/build.md](docs/build.md#xdna-amd-ryz
 
 ## Limitations and next steps
 
-- The bf16 weight cache costs 2 bytes per cached weight (the NPU's share of the model's matrices); past
-  `GGML_XDNA_NPU_CACHE_MB` the weights are converted on every call.
+- The NPU's weight cache costs 2 bytes per cached weight in bf16, 1 byte with `GGML_XDNA_NPU_W8=1` (the NPU's share
+  of the model's matrices); past `GGML_XDNA_NPU_CACHE_MB` the weights are converted on every call, which on large
+  models cancels the NPU's gain. Size the cache from the model and the free RAM.
 - Of the CPU backend's repacked weight layouts only Q4_0 and Q4_K are understood so far; other repacked types stay
   on the CPU unless you run with `--no-repack`.
 - A prompt that arrives while the model is still loading (as with `llama-cli` or `llama-bench`) stops the load-time

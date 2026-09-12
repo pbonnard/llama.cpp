@@ -56,6 +56,35 @@ Shipped kernels (XDNA1, 4 columns, bf16 in / f32 out):
 Measured on a Ryzen 7 8700G (via `pyxrt`, bf16 random data): the 512 x 512 x 128 block runs in
 ~360 us including dispatch (~185 GFLOPS) with NMSE ~3e-14 against the bf16 reference.
 
+## int8-weight kernels
+
+```
+mm_w8_i8bf16_f32_M<M>_K<K>_N<N>.xclbin / .insts.bin
+A : [M x K] int8 row-major   (weight rows; B and C as above)
+```
+
+These are the same whole-array design with an int8 A: `whole_array_w8.py` is mlir-aie's
+`whole_array.py` with int8 weight types and a different compute kernel, and `mm_w8.cc` is its
+bf16 4x8x4 `mmul` kernel (`matmul_vectorized_4x4`) with the weight vectors widened from int8 to
+bf16 in registers. Both are derived from mlir-aie (Apache-2.0 WITH LLVM-exception, see their
+headers). `build_kernels.sh` builds them after the bf16 kernels, for the same shapes (`W8_SHAPES`
+overrides). With `GGML_XDNA_NPU_W8=1` the backend keeps the NPU's weights as int8, with one
+scale per row and 1,024 weights, and applies the scale when it accumulates each block's result.
+Every kernel's K divides 1,024, so a block never spans two scales.
+
+On a Ryzen 7 8700G they launch in the same time as their bf16 twins (512 x 512 x 128: 200 vs
+184 us; 512 x 1024 x 128: 240 vs 240 us; 512 x 512 x 256: 250 vs 245 us) with NMSE ~1e-14
+against an int8 x bf16 reference. The NPU's compute time does not change; the gain is on the
+host: half the weight-cache memory and half the bytes copied per block.
+
+The `xclbinutil` shim only mounts your Windows home, so build into a directory under it when
+building from WSL. To check a kernel on the NPU (`pyxrt` from the NPU driver is built for
+Python 3.10; `XDNA_KERNEL_DIR` selects another directory):
+
+```
+uv run --no-project --python 3.10 --with numpy python npu_smoke.py mm_w8_i8bf16_f32_M512_K512_N128
+```
+
 At runtime the backend searches `$GGML_XDNA_KERNEL_DIR`, falling back to this directory's
 build-time path. `GGML_XDNA_MIN_BATCH` (default 32) sets the smallest token count a MUL_MAT
 needs before it is sent to the NPU; decode-sized products always stay on the CPU.

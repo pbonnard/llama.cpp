@@ -919,6 +919,18 @@ Usage notes:
   Qwen3-0.6B: 193 weights, 411 MB, 1.2 s).
   The first NPU operation stops the warm-up, and whatever it had not reached is converted on first
   use as before. `GGML_XDNA_NPU_WARM=0` turns it off.
+- `GGML_XDNA_NPU_W8=1` switches the NPU to int8 weights (the `mm_w8_*` kernels, see the kernels
+  README): one scale per row and 1,024 weights, applied by the host as it accumulates each block,
+  so the cache holds twice as many weights and each block copies half the bytes. The NPU's
+  compute time is unchanged. Accuracy against the stock CPU (KL divergence, NPU taking all
+  rows): Qwen3-0.6B 0.0044 vs 0.0020 for bf16, gemma-4-E2B 0.0191 vs 0.0138 (the CPU's own
+  `--no-repack` path: 0.0020 / 0.0196). Speed with the auto split (`llama-bench -p 512`):
+  Qwen3-0.6B 831 vs 784 t/s, gemma-4-E2B 241 vs 246. Off by default. It matters for large
+  models, whose NPU rows only speed things up once they fit the cache: qwen3.8:27b Q4_K_M
+  (`llama-server -ngl 0`) prefills at ~17.4 t/s on the CPU alone, and at ~19.8 t/s (+14%) with
+  the NPU and either int8 weights in a 5 GB cache or bf16 weights in a 10 GB one; with the
+  default 4 GB bf16 cache the NPU adds nothing. On a machine without a page file, keep the
+  cache well below free RAM: the 10 GB runs left no free memory, the 5 GB int8 run 4 GB.
 - `GGML_XDNA_DEBUG=1` logs every `supports_op` decision; `GGML_XDNA_MIN_BATCH=<n>` raises the token
   threshold (a very large value disables NPU use without rebuilding). `GGML_XDNA_DISABLE=1` removes
   the device altogether without opening the NPU (useful for `--version` / `--list-devices` side

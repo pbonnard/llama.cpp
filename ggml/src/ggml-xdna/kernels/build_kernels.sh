@@ -33,4 +33,20 @@ for spec in $SHAPES; do
       --xclbin-path="$OUT/$name.xclbin" --insts-path="$OUT/$name.insts.bin"
   ls -la "$OUT/$name.xclbin" "$OUT/$name.insts.bin"
 done
+
+# int8-weight kernels (A = int8 weight rows, B = bf16 activation rows, C = f32): same layouts, half the
+# weight bytes; the host applies the per-row, per-block weight scales. Design: whole_array_w8.py + mm_w8.cc.
+W8_DESIGN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/whole_array_w8.py"
+W8_SHAPES="${W8_SHAPES:-$SHAPES}"
+for spec in $W8_SHAPES; do
+  dims="${spec%%:*}"; tile="${spec##*:}"
+  M="${dims%%x*}"; rest="${dims#*x}"; K="${rest%%x*}"; N="${rest##*x}"
+  m="${tile%%,*}"; rest="${tile#*,}"; k="${rest%%,*}"; n="${rest##*,}"
+  name="mm_w8_i8bf16_f32_M${M}_K${K}_N${N}"
+  echo "==> $name  (m=$m k=$k n=$n cols=$COLS dev=$DEV)"
+  python3 "$W8_DESIGN" --dev "$DEV" \
+      -M "$M" -K "$K" -N "$N" -m "$m" -k "$k" -n "$n" --n-aie-cols "$COLS" \
+      --xclbin-path="$OUT/$name.xclbin" --insts-path="$OUT/$name.insts.bin"
+  ls -la "$OUT/$name.xclbin" "$OUT/$name.insts.bin"
+done
 echo "done: $OUT"

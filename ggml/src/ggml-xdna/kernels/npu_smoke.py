@@ -21,9 +21,11 @@ else:
     sys.path.insert(0, os.path.join(os.environ.get("XILINX_XRT", "/opt/xilinx/xrt"), "python"))
 import pyxrt  # noqa: E402
 
-KDIR = os.path.dirname(os.path.abspath(__file__))
+KDIR = os.environ.get("XDNA_KERNEL_DIR") or os.path.dirname(os.path.abspath(__file__))
 name = sys.argv[1] if len(sys.argv) > 1 else "mm_bf16_f32_M512_K512_N128"
-M, K, N = map(int, re.match(r"mm_bf16_f32_M(\d+)_K(\d+)_N(\d+)", name).groups())
+match = re.match(r"mm_(bf16|w8_i8bf16)_f32_M(\d+)_K(\d+)_N(\d+)", name)
+w8 = match.group(1) == "w8_i8bf16"   # int8 weights (A), bf16 activations (B)
+M, K, N = map(int, match.groups()[1:])
 iters = int(sys.argv[2]) if len(sys.argv) > 2 else 20
 
 
@@ -50,15 +52,20 @@ kernel = pyxrt.kernel(ctx, kname)
 
 # argument layout of an IRON runtime sequence: (opcode, instr, n_instr, A, B, C)
 bo_instr = pyxrt.bo(dev, insts.nbytes, pyxrt.bo.cacheable, kernel.group_id(1))
-bo_a = pyxrt.bo(dev, M * K * 2, pyxrt.bo.host_only, kernel.group_id(3))
+bo_a = pyxrt.bo(dev, M * K * (1 if w8 else 2), pyxrt.bo.host_only, kernel.group_id(3))
 bo_b = pyxrt.bo(dev, N * K * 2, pyxrt.bo.host_only, kernel.group_id(4))
 bo_c = pyxrt.bo(dev, N * M * 4, pyxrt.bo.host_only, kernel.group_id(5))
 
 rng = np.random.default_rng(0)
-A = rng.standard_normal((M, K)).astype(np.float32)   # weight rows
 B = rng.standard_normal((N, K)).astype(np.float32)   # activation rows
-Ab, Bb = f32_to_bf16_bits(A), f32_to_bf16_bits(B)
-ref = bf16_bits_to_f32(Bb) @ bf16_bits_to_f32(Ab).T   # [N x M] = C[t][r]
+Bb = f32_to_bf16_bits(B)
+if w8:
+    Ab = rng.integers(-127, 128, size=(M, K), dtype=np.int8)   # weight rows, as int8
+    ref = bf16_bits_to_f32(Bb) @ Ab.astype(np.float32).T      # [N x M] = C[t][r]
+else:
+    A = rng.standard_normal((M, K)).astype(np.float32)        # weight rows
+    Ab = f32_to_bf16_bits(A)
+    ref = bf16_bits_to_f32(Bb) @ bf16_bits_to_f32(Ab).T       # [N x M] = C[t][r]
 
 bo_instr.write(insts.tobytes(), 0)
 bo_instr.sync(pyxrt.xclBOSyncDirection.XCL_BO_SYNC_BO_TO_DEVICE)
