@@ -90,14 +90,17 @@ struct ggml_xdna_kernel {
     std::string insts_path;
     bool        w8 = false;   // int8 weight rows in A (mm_w8_i8bf16_f32_*); the host applies their scales
 
-    bool loaded = false;
-    bool broken = false;
+    bool     loaded     = false;
+    bool     broken     = false;
+    bool     registered = false;   // xclbin registered with the device (kept across unloads)
+    uint64_t last_use   = 0;       // for unloading the least recently used kernel
 
     xrt::xclbin     xclbin;
     xrt::hw_context hwctx;
     xrt::kernel     kernel;
     xrt::bo         bo_instr;
     size_t          n_instr = 0;
+    int             grp_a   = 0;   // memory group of the A argument (for buffers bound in its place)
 
     // two sets of operand buffers, each with its own reusable run, so the host can stage the
     // next block while the NPU computes the current one
@@ -133,6 +136,7 @@ struct ggml_xdna_state {
 
     std::unique_ptr<xrt::device>  device;
     std::vector<ggml_xdna_kernel> kernels;
+    uint64_t                      use_clock = 0;   // kernel use counter (ggml_xdna_kernel::last_use)
 
     int64_t min_batch = 32;   // smallest ne11 (tokens) worth sending to the NPU
 
@@ -178,6 +182,22 @@ struct ggml_xdna_state {
     // the NPU takes part in matmuls (it is off by default next to a GPU worker); mixture-of-experts
     // ops are only claimed then, since the CPU backend does them without an extra graph split
     std::atomic<bool>                npu_active{false};
+
+    // GGML_XDNA_NPU_DECODE: model weights laid out once in NPU buffers, one per (row block, K block)
+    // of the weight's decode kernel, so that decode launches read them in place instead of copying
+    // the whole model through the host on every token. Guarded by mutex.
+    struct decode_weight {
+        ggml_xdna_kernel *   k      = nullptr;
+        int64_t              n_rows = 0;
+        int64_t              n_k    = 0;
+        std::vector<xrt::bo> blocks;           // [row block][K block], k->M x k->K each, zero-padded
+        std::vector<float>   scales;           // int8 weights: [n_rows x groups of GGML_XDNA_W8_GROUP]
+        uint64_t             sig    = 0;
+        size_t               bytes  = 0;
+        bool                 failed = false;   // did not fit or failed: the CPU computes this weight
+    };
+    std::map<const void *, decode_weight> decode_weights;
+    size_t                                decode_bytes = 0;
 
     ~ggml_xdna_state() {
         warm_stop = true;
@@ -351,6 +371,124 @@ static void ggml_xdna_probe_locked(ggml_xdna_state & st) {
     }
 }
 
+// Each loaded kernel holds one NPU hardware context, and the XDNA1 driver (32.0.20102, 8700G) grants
+// only 5 at a time: more fail with "Failed to create context". The backend keeps at most
+// GGML_XDNA_MAX_KERNELS (default 5) loaded and unloads the least recently used one to make room,
+// also when another process holds contexts and a creation fails below that number.
+static int ggml_xdna_max_kernels() {
+    static const int n = []() {
+        const char * env = ggml_xdna_getenv("GGML_XDNA_MAX_KERNELS");
+        return env != nullptr ? std::max(1, std::atoi(env)) : 5;
+    }();
+    return n;
+}
+
+static int ggml_xdna_n_loaded(const ggml_xdna_state & st) {
+    int n = 0;
+    for (const auto & k : st.kernels) {
+        n += k.loaded ? 1 : 0;
+    }
+    return n;
+}
+
+// release k's hardware context and buffers; its measured launch time is kept
+static void ggml_xdna_kernel_unload(ggml_xdna_kernel & k) {
+    for (auto & s : k.slots) {
+        s = ggml_xdna_kernel::slot();
+    }
+    k.bo_instr = xrt::bo();
+    k.kernel   = xrt::kernel();
+    k.hwctx    = xrt::hw_context();
+    k.loaded   = false;
+}
+
+// unload the least recently used loaded kernel other than keep; false if there is none
+static bool ggml_xdna_evict_lru(ggml_xdna_state & st, const ggml_xdna_kernel * keep) {
+    ggml_xdna_kernel * lru = nullptr;
+    for (auto & o : st.kernels) {
+        if (o.loaded && &o != keep && (lru == nullptr || o.last_use < lru->last_use)) {
+            lru = &o;
+        }
+    }
+    if (lru == nullptr) {
+        return false;
+    }
+    GGML_LOG_INFO("%s: unloading %s to free an NPU context\n", __func__, fs::path(lru->xclbin_path).filename().string().c_str());
+    ggml_xdna_kernel_unload(*lru);
+    return true;
+}
+
+// time to load a kernel (xclbin, context, buffers), measured ~90 ms; the kernel picker charges it to
+// a kernel that would unload another one
+static constexpr double GGML_XDNA_KERNEL_SWAP_US = 90000.0;
+
+// open k on the NPU: instruction stream, xclbin, hardware context, buffers; throws on failure, with
+// at_context set if creating the hardware context failed
+static void ggml_xdna_kernel_open(ggml_xdna_state & st, ggml_xdna_kernel & k, bool & at_context) {
+    std::ifstream f(k.insts_path, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("cannot open " + k.insts_path);
+    }
+    std::vector<char> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (bytes.empty() || bytes.size() % 4 != 0) {
+        throw std::runtime_error("malformed instruction stream " + k.insts_path);
+    }
+    k.n_instr = bytes.size() / sizeof(uint32_t);
+
+    k.xclbin = xrt::xclbin(k.xclbin_path);
+
+    std::string kname;
+    for (const auto & xk : k.xclbin.get_kernels()) {
+        const std::string name = xk.get_name();
+        if (name.rfind(GGML_XDNA_KERNEL_PREFIX, 0) == 0) {
+            kname = name;
+            break;
+        }
+    }
+    if (kname.empty()) {
+        throw std::runtime_error("no " GGML_XDNA_KERNEL_PREFIX "* kernel in " + k.xclbin_path);
+    }
+
+    if (!k.registered) {
+        st.device->register_xclbin(k.xclbin);
+        k.registered = true;
+    }
+    at_context = true;
+    k.hwctx    = xrt::hw_context(*st.device, k.xclbin.get_uuid());
+    at_context = false;
+    k.kernel   = xrt::kernel(k.hwctx, kname);
+    k.grp_a    = k.kernel.group_id(3);
+
+    // argument layout of an IRON runtime sequence: (opcode, instr, n_instr, A, B, C)
+    k.bo_instr = xrt::bo(*st.device, bytes.size(), xrt::bo::flags::cacheable, k.kernel.group_id(1));
+    std::memcpy(k.bo_instr.map<void *>(), bytes.data(), bytes.size());
+    k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    for (auto & s : k.slots) {
+        s.a = xrt::bo(*st.device, k.M*k.K*(k.w8 ? sizeof(int8_t) : sizeof(ggml_bf16_t)), xrt::bo::flags::host_only, k.kernel.group_id(3));
+        s.b = xrt::bo(*st.device, k.N*k.K*sizeof(ggml_bf16_t), xrt::bo::flags::host_only, k.kernel.group_id(4));
+        s.c = xrt::bo(*st.device, k.N*k.M*sizeof(float),       xrt::bo::flags::host_only, k.kernel.group_id(5));
+        if (k.w8) {
+            s.a8_map = s.a.map<int8_t *>();
+        } else {
+            s.a_map = s.a.map<ggml_bf16_t *>();
+        }
+        s.b_map = s.b.map<ggml_bf16_t *>();
+        s.c_map = s.c.map<float *>();
+
+        s.run = xrt::run(k.kernel);
+        s.run.set_arg(0, GGML_XDNA_OPCODE_TXN);
+        s.run.set_arg(1, k.bo_instr);
+        s.run.set_arg(2, k.n_instr);
+        s.run.set_arg(3, s.a);
+        s.run.set_arg(4, s.b);
+        s.run.set_arg(5, s.c);
+    }
+
+    GGML_LOG_INFO("%s: loaded %s (kernel %s, %zu instruction words)\n",
+                  __func__, fs::path(k.xclbin_path).filename().string().c_str(), kname.c_str(), k.n_instr);
+}
+
 static bool ggml_xdna_kernel_load(ggml_xdna_state & st, ggml_xdna_kernel & k) {
     if (k.loaded) {
         return true;
@@ -359,69 +497,25 @@ static bool ggml_xdna_kernel_load(ggml_xdna_state & st, ggml_xdna_kernel & k) {
         return false;
     }
 
-    try {
-        std::ifstream f(k.insts_path, std::ios::binary);
-        if (!f) {
-            throw std::runtime_error("cannot open " + k.insts_path);
-        }
-        std::vector<char> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        if (bytes.empty() || bytes.size() % 4 != 0) {
-            throw std::runtime_error("malformed instruction stream " + k.insts_path);
-        }
-        k.n_instr = bytes.size() / sizeof(uint32_t);
+    for (int n = ggml_xdna_n_loaded(st); n >= ggml_xdna_max_kernels() && ggml_xdna_evict_lru(st, &k); n--) {
+    }
 
-        k.xclbin = xrt::xclbin(k.xclbin_path);
-
-        std::string kname;
-        for (const auto & xk : k.xclbin.get_kernels()) {
-            const std::string name = xk.get_name();
-            if (name.rfind(GGML_XDNA_KERNEL_PREFIX, 0) == 0) {
-                kname = name;
-                break;
+    for (;;) {
+        bool at_context = false;
+        try {
+            ggml_xdna_kernel_open(st, k, at_context);
+            k.loaded   = true;
+            k.last_use = ++st.use_clock;
+            return true;
+        } catch (const std::exception & e) {
+            ggml_xdna_kernel_unload(k);
+            if (at_context && ggml_xdna_evict_lru(st, &k)) {
+                continue;   // out of hardware contexts: retry with one more free
             }
+            GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, k.xclbin_path.c_str(), e.what());
+            k.broken = true;
+            return false;
         }
-        if (kname.empty()) {
-            throw std::runtime_error("no " GGML_XDNA_KERNEL_PREFIX "* kernel in " + k.xclbin_path);
-        }
-
-        st.device->register_xclbin(k.xclbin);
-        k.hwctx  = xrt::hw_context(*st.device, k.xclbin.get_uuid());
-        k.kernel = xrt::kernel(k.hwctx, kname);
-
-        // argument layout of an IRON runtime sequence: (opcode, instr, n_instr, A, B, C)
-        k.bo_instr = xrt::bo(*st.device, bytes.size(), xrt::bo::flags::cacheable, k.kernel.group_id(1));
-        std::memcpy(k.bo_instr.map<void *>(), bytes.data(), bytes.size());
-        k.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        for (auto & s : k.slots) {
-            s.a = xrt::bo(*st.device, k.M*k.K*(k.w8 ? sizeof(int8_t) : sizeof(ggml_bf16_t)), xrt::bo::flags::host_only, k.kernel.group_id(3));
-            s.b = xrt::bo(*st.device, k.N*k.K*sizeof(ggml_bf16_t), xrt::bo::flags::host_only, k.kernel.group_id(4));
-            s.c = xrt::bo(*st.device, k.N*k.M*sizeof(float),       xrt::bo::flags::host_only, k.kernel.group_id(5));
-            if (k.w8) {
-                s.a8_map = s.a.map<int8_t *>();
-            } else {
-                s.a_map = s.a.map<ggml_bf16_t *>();
-            }
-            s.b_map = s.b.map<ggml_bf16_t *>();
-            s.c_map = s.c.map<float *>();
-
-            s.run = xrt::run(k.kernel);
-            s.run.set_arg(0, GGML_XDNA_OPCODE_TXN);
-            s.run.set_arg(1, k.bo_instr);
-            s.run.set_arg(2, k.n_instr);
-            s.run.set_arg(3, s.a);
-            s.run.set_arg(4, s.b);
-            s.run.set_arg(5, s.c);
-        }
-
-        k.loaded = true;
-        GGML_LOG_INFO("%s: loaded %s (kernel %s, %zu instruction words)\n",
-                      __func__, fs::path(k.xclbin_path).filename().string().c_str(), kname.c_str(), k.n_instr);
-        return true;
-    } catch (const std::exception & e) {
-        GGML_LOG_ERROR("%s: failed to load %s: %s\n", __func__, k.xclbin_path.c_str(), e.what());
-        k.broken = true;
-        return false;
     }
 }
 
@@ -444,27 +538,42 @@ static bool ggml_xdna_slot_wait(ggml_xdna_kernel::slot & s) {
 }
 
 // estimated wall time of one launch of k: measured once it has run, otherwise a model fitted
-// on a Ryzen 7 8700G (~0.2 ms fixed dispatch + sync cost, ~200 GMAC/s of block compute; the
-// 512x512x128 block measures ~360 us)
+// on a Ryzen 7 8700G with pyxrt (median of 50 launches): bf16 ~180 us fixed dispatch + sync cost
+// and ~1 TMAC/s of block compute (256x512x64 179 us, 512x512x128 206 us, 256x1024x512 303 us,
+// 512x1024x512 454 us); int8 weights ~190 us + ~0.77 TMAC/s (512x1024x512 542 us)
 static double ggml_xdna_kernel_launch_us(const ggml_xdna_kernel & k) {
     if (k.launch_us > 0.0) {
         return k.launch_us;
     }
-    return 200.0 + (double) k.M*k.K*k.N/200.0e3;
+    const double macs = (double) k.M*k.K*k.N;
+    if (k.N <= 64 && k.M >= 1024) {
+        // decode kernels (n = 16 per core) run far below the batched ones' MAC rate: bf16
+        // 1024x1024x64 285 us, 2048x1024x64 475 us, 4096x1024x64 863 us; int8 303 / 499 / 851 us
+        return k.w8 ? 120.0 + macs/0.37e6 : 90.0 + macs/0.35e6;
+    }
+    return k.w8 ? 190.0 + macs/0.77e6 : 180.0 + macs/1.0e6;
+}
+
+// decode kernels (a few tokens against 1,024+ weight rows per launch; N = 64 is the smallest token
+// block of the 4-column bf16 design) serve only the decode path (GGML_XDNA_NPU_DECODE), which reads
+// their weights in place; the batched path copies every weight block, so it keeps to the others
+static bool ggml_xdna_is_decode_kernel(const ggml_xdna_kernel & k) {
+    return k.N <= 64 && k.M >= 1024;
 }
 
 // pick the kernel with the least estimated NPU time for this problem; padded work and the
 // fixed per-launch cost both count, so a small block only wins when it saves real work
 static ggml_xdna_kernel * ggml_xdna_select_kernel(ggml_xdna_state & st, int64_t n_feat, int64_t n_k, int64_t n_tok, bool w8) {
     std::lock_guard<std::mutex> lock(st.mutex);   // launch_us is updated by running kernels
+    const bool full = ggml_xdna_n_loaded(st) >= ggml_xdna_max_kernels();
     ggml_xdna_kernel * best = nullptr;
     double best_cost = 0.0;
     for (auto & k : st.kernels) {
-        if (k.broken || k.w8 != w8) {
+        if (k.broken || k.w8 != w8 || ggml_xdna_is_decode_kernel(k)) {
             continue;
         }
         const double launches = (double) ((n_feat + k.M - 1)/k.M) * ((n_k + k.K - 1)/k.K) * ((n_tok + k.N - 1)/k.N);
-        const double cost = launches * ggml_xdna_kernel_launch_us(k);
+        const double cost = launches * ggml_xdna_kernel_launch_us(k) + (!k.loaded && full ? GGML_XDNA_KERNEL_SWAP_US : 0.0);
         if (best == nullptr || cost < best_cost) {
             best = &k;
             best_cost = cost;
@@ -524,12 +633,14 @@ struct ggml_backend_xdna_context {
     size_t vk_weight_limit = (size_t) 8 << 30;
 
     // auto split: each worker's measured speed per matrix shape (n_feat, K, src0 type), in
-    // rows*tokens per ms, and its average rate in MACs per ms as the prior for unseen shapes
+    // rows*tokens per ms, and its average rate in MACs per ms as the prior for unseen shapes. The
+    // NPU is predicted from its kernels' block times instead (its time depends on the kernel a
+    // row count selects, not only on the rows), scaled by a correction measured per shape.
     struct shape_perf {
-        double thr[3] = { 0.0, 0.0, 0.0 };   // NPU, VK, CPU
+        double thr[3] = { 0.0, 0.0, 0.0 };   // NPU (informational), VK, CPU
         bool   npu_seen  = false;             // the NPU has run this shape (its first run is not learned)
         int    npu_skips = 0;                 // ops planned without the NPU since it was measured
-        double moe_corr  = 0.0;               // mixture of experts: measured / modelled NPU time (0 until known)
+        double npu_corr  = 0.0;               // measured / modelled NPU time (0 until known)
     };
     std::map<std::tuple<int64_t, int64_t, int>, shape_perf> shape_perf_map;
     double mac_thr[3] = { 0.0, 0.0, 0.0 };   // NPU, VK, CPU
@@ -1474,6 +1585,7 @@ static void ggml_xdna_npu_gemm(ggml_backend_xdna_context * ctx, const ggml_tenso
     if (use_npu && !was_loaded) {
         ctx->npu_cold = true;   // this op paid for loading the kernel: its time says nothing about the NPU's speed
     }
+    k.last_use = ++st.use_clock;
     if (!use_npu && !ctx->warned_fallback) {
         GGML_LOG_WARN("%s: NPU kernel unavailable, computing on the host instead\n", __func__);
         ctx->warned_fallback = true;
@@ -1685,7 +1797,8 @@ static void ggml_xdna_warm_items(ggml_xdna_state & st, ggml_backend_xdna_context
         for (ggml_xdna_kernel * k : { ggml_xdna_select_npu_kernel(st, &t, rows, n_k, item.n_tok), ggml_xdna_select_npu_kernel(st, &t, n_feat, n_k, item.n_tok) }) {
             if (k != nullptr && !st.warm_stop) {
                 std::lock_guard<std::mutex> lock(st.mutex);
-                if (!k->loaded && !k->broken && ggml_xdna_kernel_load(st, *k)) {
+                // never unload a kernel for the warm-up: it would only guess which one an op needs
+                if (!k->loaded && !k->broken && ggml_xdna_n_loaded(st) < ggml_xdna_max_kernels() && ggml_xdna_kernel_load(st, *k)) {
                     n_kernels++;
                 }
             }
@@ -1867,10 +1980,15 @@ static void ggml_xdna_warm_release() {
     st.warm_seen.clear();
     lock.unlock();
 
-    std::lock_guard<std::mutex> cache_lock(st.cache_mutex);
-    st.npu_weights.clear();
-    st.npu_weights_w8.clear();
-    st.npu_weight_bytes = 0;
+    {
+        std::lock_guard<std::mutex> cache_lock(st.cache_mutex);
+        st.npu_weights.clear();
+        st.npu_weights_w8.clear();
+        st.npu_weight_bytes = 0;
+    }
+    std::lock_guard<std::mutex> state_lock(st.mutex);
+    st.decode_weights.clear();
+    st.decode_bytes = 0;
 }
 
 // shape key for the auto split; repacked and plain weights of the same shape run at different speeds
@@ -1878,10 +1996,38 @@ static std::tuple<int64_t, int64_t, int> ggml_xdna_shape_key(const struct ggml_t
     return std::make_tuple(src0->ne[1], src0->ne[0], (int) src0->type + (ggml_xdna_is_cpu_repack(src0) ? 1000 : 0));
 }
 
+// the smallest row block of the kernels src0's NPU rows can run on (0: none)
+static int64_t ggml_xdna_npu_row_step(ggml_xdna_state & st, const ggml_tensor * src0) {
+    std::lock_guard<std::mutex> lock(st.mutex);
+    int64_t step_w8 = 0, step_bf16 = 0;
+    for (const auto & k : st.kernels) {
+        if (k.broken || ggml_xdna_is_decode_kernel(k)) {
+            continue;
+        }
+        int64_t & s = k.w8 ? step_w8 : step_bf16;
+        s = s == 0 ? k.M : std::min(s, k.M);
+    }
+    return ggml_xdna_npu_use_w8(src0) && step_w8 > 0 ? step_w8 : step_bf16;
+}
+
+// modelled NPU time in ms for rows [0, c) of one plane of src0 against n_tok activation rows, on the
+// kernel ggml_xdna_npu_gemm would pick (-1: no kernel)
+static double ggml_xdna_npu_model_ms(ggml_xdna_state & st, const ggml_tensor * src0, int64_t c, int64_t n_tok) {
+    const int64_t n_k = src0->ne[0];
+    const ggml_xdna_kernel * k = ggml_xdna_select_npu_kernel(st, src0, c, n_k, n_tok);
+    if (k == nullptr) {
+        return -1.0;
+    }
+    const double blocks = (double) ((c + k->M - 1)/k->M) * ((n_k + k->K - 1)/k->K) * ((n_tok + k->N - 1)/k->N);
+    std::lock_guard<std::mutex> lock(st.mutex);   // launch_us is updated by running kernels
+    return blocks*ggml_xdna_kernel_launch_us(*k)/1000.0;
+}
+
 // auto split: choose how many rows each worker gets by predicted finish time. The NPU takes whole
 // kernel blocks (none, some, or all rows); the rest is shared by the Vulkan and CPU workers in
-// proportion to their speed. Speeds are learned per matrix shape; for a shape not seen yet the NPU
-// is estimated from its kernel's per-block time and the other workers from their average MAC rate.
+// proportion to their speed. Speeds are learned per matrix shape; the NPU is modelled from its
+// kernels' block times (corrected per shape by measurement), the other workers from their measured
+// speed on the shape, or their average MAC rate for a shape not seen yet.
 // Returns false until the Vulkan/CPU workers have been measured once (the caller then uses the
 // default shares, which measures them).
 static bool ggml_xdna_plan_auto(ggml_backend_xdna_context * ctx, ggml_xdna_state & st, const struct ggml_tensor * dst,
@@ -1917,22 +2063,27 @@ static bool ggml_xdna_plan_auto(ggml_backend_xdna_context * ctx, ggml_xdna_state
     // rows per ms of the Vulkan and CPU workers together
     const double rest_rate = (vk_on ? 1.0/r_vk : 0.0) + (cpu_on ? 1.0/r_cpu : 0.0);
 
-    const ggml_xdna_kernel * kp = npu_ok ? ggml_xdna_select_npu_kernel(st, src0, n_feat, n_k, n_tok) : nullptr;
-    const double npu_ms_per_row = thr != nullptr && thr[GGML_XDNA_WORKER_NPU] > 0.0 ? (double) n_tok/thr[GGML_XDNA_WORKER_NPU] : -1.0;
+    // the NPU for c rows: the kernel model for the kernel c rows would run on, times this shape's
+    // measured correction (host staging, conversions); c steps over the smallest kernel block, so
+    // a 256-row kernel lets the NPU take a quarter of a 1024-row matrix
+    const int64_t n_planes = dst->ne[2]*dst->ne[3];
+    const int64_t step     = npu_ok ? ggml_xdna_npu_row_step(st, src0) : 0;
+    const double  corr     = it != ctx->shape_perf_map.end() && it->second.npu_corr > 0.0 ? it->second.npu_corr : 1.0;
     auto t_npu = [&](int64_t c) -> double {
-        if (npu_ms_per_row > 0.0) {
-            return c*npu_ms_per_row;
-        }
-        const double blocks = (double) ((c + kp->M - 1)/kp->M) * ((n_k + kp->K - 1)/kp->K) * ((n_tok + kp->N - 1)/kp->N);
-        return blocks*ggml_xdna_kernel_launch_us(*kp)/1000.0;
+        const double ms = ggml_xdna_npu_model_ms(st, src0, c, n_tok);
+        return ms < 0.0 ? -1.0 : ms*n_planes*corr;
     };
 
     int64_t best_c = 0;
     double  best_t = (double) n_feat/rest_rate;
-    if (kp != nullptr) {
-        for (int64_t c = kp->M; ; c += kp->M) {
+    if (step > 0) {
+        for (int64_t c = step; ; c += step) {
             c = std::min(c, n_feat);
-            const double t = std::max(t_npu(c), (n_feat - c)/rest_rate);
+            const double tn = t_npu(c);
+            if (tn < 0.0) {
+                break;
+            }
+            const double t = std::max(tn, (n_feat - c)/rest_rate);
             if (t < best_t) {
                 best_t = t;
                 best_c = c;
@@ -1946,9 +2097,9 @@ static bool ggml_xdna_plan_auto(ggml_backend_xdna_context * ctx, ggml_xdna_state
     // a worker left out is never measured again, so a single bad sample (a busy moment, some
     // first-use cost) would keep the NPU off this shape for good: every 16th op without it, give
     // it one block so its estimate can recover
-    if (best_c == 0 && kp != nullptr && npu_ms_per_row > 0.0 && it != ctx->shape_perf_map.end()) {
+    if (best_c == 0 && step > 0 && it != ctx->shape_perf_map.end() && it->second.npu_corr > 0.0) {
         if (++it->second.npu_skips % 16 == 0) {
-            best_c = std::min(kp->M, n_feat);
+            best_c = std::min(step, n_feat);
             best_t = std::max(t_npu(best_c), (n_feat - best_c)/rest_rate);
         }
     }
@@ -1964,6 +2115,328 @@ static bool ggml_xdna_plan_auto(ggml_backend_xdna_context * ctx, ggml_xdna_state
     n[GGML_XDNA_WORKER_CPU] = rest - n[GGML_XDNA_WORKER_VK];
     *t_pred = best_t;
     return true;
+}
+
+// -------------------------------------------------------------------------------------------------
+// decode path (experimental, GGML_XDNA_NPU_DECODE)
+
+// GGML_XDNA_NPU_DECODE: the NPU also computes decode-sized matmuls (fewer than GGML_XDNA_MIN_BATCH
+// tokens: token generation, speculative-decoding verification). 1: all rows of each such matmul on
+// the NPU; a fraction: that share of its rows, the CPU doing the rest at the same time; unset / 0:
+// off (the default - on a Ryzen 7 8700G the CPU decodes faster, this is for experiments)
+static float ggml_xdna_decode_share() {
+    static const float share = []() {
+        const char * env = ggml_xdna_getenv("GGML_XDNA_NPU_DECODE");
+        return env != nullptr ? (float) std::min(1.0, std::max(0.0, std::atof(env))) : 0.0f;
+    }();
+    return share;
+}
+
+// memory for the decode path's weight store: GGML_XDNA_DECODE_CACHE_MB (default 8192)
+static size_t ggml_xdna_decode_cache_limit() {
+    static const size_t limit = []() {
+        const char * env = ggml_xdna_getenv("GGML_XDNA_DECODE_CACHE_MB");
+        return env != nullptr ? (size_t) std::max(0LL, std::atoll(env)) << 20 : (size_t) 8 << 30;
+    }();
+    return limit;
+}
+
+static bool ggml_xdna_have_decode_kernels(const ggml_xdna_state & st) {
+    for (const auto & k : st.kernels) {
+        if (ggml_xdna_is_decode_kernel(k)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// the decode kernel for a weight format: one for all weights, the one with the smallest row block.
+// Each kernel has its own hardware context, and at decode an op that follows one on another kernel
+// waits ~1.3 ms for the NPU to switch contexts (Qwen3-0.6B: its only 2048-row product took 1.76 ms
+// against 0.48 ms alone), which costs more than any kernel's better fit to a weight; small blocks
+// also pad narrow weights least. st.mutex held.
+static ggml_xdna_kernel * ggml_xdna_select_decode_kernel(ggml_xdna_state & st, bool w8) {
+    ggml_xdna_kernel * best = nullptr;
+    for (auto & k : st.kernels) {
+        if (k.broken || k.w8 != w8 || !ggml_xdna_is_decode_kernel(k)) {
+            continue;
+        }
+        if (best == nullptr || k.M < best->M || (k.M == best->M && k.K*k.N < best->K*best->N)) {
+            best = &k;
+        }
+    }
+    return best;
+}
+
+// the decode store entry of 2-D weight src0, created on first use; nullptr if it does not fit or
+// could not be built (the CPU then computes the weight's products). st.mutex held.
+static ggml_xdna_state::decode_weight * ggml_xdna_decode_weight(ggml_backend_xdna_context * ctx, ggml_xdna_state & st, const ggml_tensor * src0) {
+    const int64_t  n_k    = src0->ne[0];
+    const int64_t  n_feat = src0->ne[1];
+    const uint64_t sig    = ggml_xdna_weight_sig(src0->data, n_feat*src0->nb[1], src0->type, n_k);
+
+    auto it = st.decode_weights.find(src0->data);
+    if (it != st.decode_weights.end()) {
+        if (it->second.sig == sig) {
+            return it->second.failed ? nullptr : &it->second;
+        }
+        st.decode_bytes -= it->second.bytes;   // the address was reused by different weights
+        st.decode_weights.erase(it);
+    }
+    auto & dw = st.decode_weights[src0->data];
+    dw.sig    = sig;
+    dw.n_rows = n_feat;
+    dw.n_k    = n_k;
+    dw.failed = true;   // until built
+
+    ggml_xdna_kernel * k = ggml_xdna_npu_use_w8(src0) ? ggml_xdna_select_decode_kernel(st, true) : nullptr;
+    if (k == nullptr) {
+        k = ggml_xdna_select_decode_kernel(st, false);
+    }
+    if (k == nullptr || !ggml_xdna_kernel_load(st, *k)) {   // loaded for its memory group
+        return nullptr;
+    }
+
+    const int64_t nb_i  = (n_feat + k->M - 1)/k->M;
+    const int64_t nb_k  = (n_k    + k->K - 1)/k->K;
+    const int64_t n_g   = (n_k + GGML_XDNA_W8_GROUP - 1)/GGML_XDNA_W8_GROUP;
+    const size_t  esize = k->w8 ? sizeof(int8_t) : sizeof(ggml_bf16_t);
+    const size_t  bytes = (size_t) (nb_i*nb_k*k->M*k->K)*esize + (k->w8 ? (size_t) n_feat*n_g*sizeof(float) : 0);
+    if (st.decode_bytes + bytes > ggml_xdna_decode_cache_limit() || !ggml_xdna_can_commit(bytes)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: decode weight store full (%.0f MB, GGML_XDNA_DECODE_CACHE_MB): the CPU computes the other weights\n",
+                          __func__, st.decode_bytes/1048576.0);
+        }
+        return nullptr;
+    }
+
+    try {
+        std::vector<ggml_bf16_t> rows;
+        std::vector<int8_t>      rows_q;
+        if (k->w8) {
+            dw.scales.resize((size_t) n_feat*n_g);
+        }
+        dw.blocks.reserve(nb_i*nb_k);
+        for (int64_t i = 0; i < nb_i; i++) {
+            const int64_t r0 = i*k->M;
+            const int64_t nr = std::min(k->M, n_feat - r0);
+            if (k->w8) {
+                rows_q.resize((size_t) nr*n_k);
+                ggml_xdna_weight_rows_to_i8(ctx, src0, r0, nr, 0, 0, rows_q.data(), dw.scales.data() + r0*n_g);
+            } else {
+                rows.resize((size_t) nr*n_k);
+                ggml_xdna_weight_rows_to_bf16(ctx, src0, r0, nr, 0, 0, rows.data(), n_k);
+            }
+            for (int64_t kb = 0; kb < nb_k; kb++) {
+                const int64_t k0 = kb*k->K;
+                const int64_t kk = std::min(k->K, n_k - k0);
+                xrt::bo bo(*st.device, (size_t) k->M*k->K*esize, xrt::bo::flags::host_only, k->grp_a);
+                if (k->w8) {
+                    ggml_xdna_fill_block_i8(bo.map<int8_t *>(), k->M, k->K, rows_q.data() + k0, n_k, nr, kk);
+                } else {
+                    ggml_xdna_fill_block(bo.map<ggml_bf16_t *>(), k->M, k->K, rows.data() + k0, n_k, nr, kk);
+                }
+                bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                dw.blocks.push_back(std::move(bo));
+            }
+        }
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("%s: cannot store %s for the NPU (%s): the CPU computes it\n", __func__, src0->name, e.what());
+        dw.blocks.clear();
+        dw.scales.clear();
+        dw.scales.shrink_to_fit();
+        return nullptr;
+    }
+
+    dw.k      = k;
+    dw.bytes  = bytes;
+    dw.failed = false;
+    st.decode_bytes += bytes;
+    ctx->npu_cold = true;
+    return &dw;
+}
+
+// out_row(t)[r] for rows r in [0, c) of a stored weight and the n_tok bf16 activation rows in x (row
+// stride n_k). Pipelined over the kernel's two slots; each launch binds its stored weight block in
+// place of the slot's own A buffer, so the host only stages the activations. st.mutex held; throws
+// on an NPU error.
+static void ggml_xdna_npu_decode_gemm(ggml_backend_xdna_context * ctx, ggml_xdna_state & st, const ggml_xdna_state::decode_weight & dw,
+                                      int64_t c, const ggml_bf16_t * x, int64_t n_tok, const std::function<float * (int64_t)> & out_row) {
+    ggml_xdna_kernel & k = *dw.k;
+    const bool was_loaded = k.loaded;
+    if (!ggml_xdna_kernel_load(st, k)) {
+        throw std::runtime_error("decode kernel unavailable");
+    }
+    if (!was_loaded) {
+        ctx->npu_cold = true;
+    }
+    k.last_use = ++st.use_clock;
+
+    const int64_t n_k  = dw.n_k;
+    const int64_t nb_k = (n_k + k.K - 1)/k.K;
+    const int64_t n_g  = (n_k + GGML_XDNA_W8_GROUP - 1)/GGML_XDNA_W8_GROUP;
+
+    struct block { int64_t j0, i, kb; };
+    std::vector<block> blocks;
+    for (int64_t j0 = 0; j0 < n_tok; j0 += k.N) {
+        for (int64_t i = 0; i*k.M < c; i++) {
+            for (int64_t kb = 0; kb < nb_k; kb++) {
+                blocks.push_back({ j0, i, kb });
+            }
+        }
+    }
+
+    // prefill launches of this kernel expect each slot's own A buffer: put it back afterwards
+    struct restore_a {
+        ggml_xdna_kernel & k;
+        ~restore_a() {
+            for (auto & s : k.slots) {
+                try { s.run.set_arg(3, s.a); } catch (...) {}
+            }
+        }
+    } restore { k };
+
+    auto start = [&](ggml_xdna_kernel::slot & s, const block & bl) {
+        const int64_t k0 = bl.kb*k.K;
+        ggml_xdna_fill_block(s.b_map, k.N, k.K, x + bl.j0*n_k + k0, n_k, std::min(k.N, n_tok - bl.j0), std::min(k.K, n_k - k0));
+        s.run.set_arg(3, dw.blocks[bl.i*nb_k + bl.kb]);
+        s.b.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        s.run.start();
+    };
+    // C block is [k.N x k.M]: row t = token, col r = feature
+    auto consume = [&](const float * cb, const block & bl) {
+        const int64_t i0     = bl.i*k.M;
+        const int64_t m_rows = std::min(k.M, c - i0);
+        const int64_t k0     = bl.kb*k.K;
+        const float * sc     = k.w8 ? dw.scales.data() + i0*n_g + k0/GGML_XDNA_W8_GROUP : nullptr;
+        for (int64_t t = 0; t < std::min(k.N, n_tok - bl.j0); t++) {
+            float       * drow = out_row(bl.j0 + t) + i0;
+            const float * crow = cb + t*k.M;
+            if (sc != nullptr) {
+                if (k0 == 0) {
+                    for (int64_t r = 0; r < m_rows; r++) { drow[r]  = crow[r]*sc[r*n_g]; }
+                } else {
+                    for (int64_t r = 0; r < m_rows; r++) { drow[r] += crow[r]*sc[r*n_g]; }
+                }
+            } else if (k0 == 0) {
+                std::memcpy(drow, crow, m_rows*sizeof(float));
+            } else {
+                for (int64_t r = 0; r < m_rows; r++) { drow[r] += crow[r]; }
+            }
+        }
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        start(k.slots[0], blocks[0]);
+        for (size_t i = 0; i < blocks.size(); i++) {
+            auto & cur = k.slots[i % 2];
+            if (i + 1 < blocks.size()) {
+                start(k.slots[(i + 1) % 2], blocks[i + 1]);
+            }
+            if (!ggml_xdna_slot_wait(cur)) {
+                throw std::runtime_error("kernel did not complete");
+            }
+            consume(cur.c_map, blocks[i]);
+        }
+    } catch (...) {
+        for (auto & s : k.slots) {
+            try { s.run.wait(std::chrono::milliseconds(1000)); } catch (...) {}
+        }
+        throw;
+    }
+
+    if (!ctx->npu_cold && k.n_ops++ > 0) {
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()/blocks.size();
+        k.launch_us = k.launch_us > 0.0 ? 0.9*k.launch_us + 0.1*us : us;
+    }
+}
+
+// a decode-sized MUL_MAT (admitted only with GGML_XDNA_NPU_DECODE, 2-D operands): the leading rows
+// of a stored weight on the NPU, the rest on the CPU at the same time
+static void ggml_xdna_mul_mat_decode(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    const int64_t n_k    = src0->ne[0];
+    const int64_t n_feat = src0->ne[1];
+    const int64_t n_tok  = src1->ne[1];
+    const float   share  = ggml_xdna_decode_share();
+
+    ggml_xdna_state & st = ggml_xdna_get_state();
+
+    if (!ggml_xdna_is_weight(src0)) {
+        // not a model weight (nothing to store): the batched path's copying kernels at share 1
+        bool npu_ok = false;
+        if (share >= 1.0f) {
+            try {
+                ggml_xdna_mul_mat_npu(ctx, dst, 0, n_feat);
+                npu_ok = true;
+            } catch (const std::exception & e) {
+                GGML_LOG_WARN("%s: NPU failed (%s), computing on the CPU\n", __func__, e.what());
+            }
+        }
+        if (!npu_ok && !ggml_xdna_mul_mat_cpu(ctx, dst, 0, n_feat)) {
+            GGML_ABORT("%s: the CPU worker failed", __func__);
+        }
+        return;
+    }
+
+    if ((int64_t) ctx->x_bf16.size() < n_tok*n_k) {
+        ctx->x_bf16.resize(n_tok*n_k);
+    }
+    ggml_xdna_rows_to_bf16(ctx, src1, 0, n_tok, 0, 0, ctx->x_bf16.data(), n_k);
+
+    const auto t_start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(st.mutex);
+    ctx->npu_cold = false;
+    ggml_xdna_state::decode_weight * dw = ggml_xdna_decode_weight(ctx, st, src0);
+
+    // the NPU's rows: all of them, or a share rounded to whole row blocks of the stored layout
+    int64_t c = 0;
+    if (dw != nullptr) {
+        const int64_t bm = dw->k->M;
+        c = share >= 1.0f ? n_feat : std::min(n_feat, (int64_t) (n_feat*share + bm/2)/bm*bm);
+        if (c > 0 && n_feat - c < 16) {
+            c = n_feat;
+        }
+    }
+    if (c == 0) {
+        lock.unlock();
+        if (!ggml_xdna_mul_mat_cpu(ctx, dst, 0, n_feat)) {
+            GGML_ABORT("%s: the CPU worker failed", __func__);
+        }
+        return;
+    }
+
+    std::future<bool> cpu;
+    if (c < n_feat) {
+        cpu = std::async(std::launch::async, [&]() { return ggml_xdna_mul_mat_cpu(ctx, dst, c, n_feat); });
+    }
+    bool npu_ok = true;
+    try {
+        ggml_xdna_npu_decode_gemm(ctx, st, *dw, c, ctx->x_bf16.data(), n_tok,
+                                  [&](int64_t t) { return (float *) ((char *) dst->data + t*dst->nb[1]); });
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("%s: NPU failed (%s), computing its rows on the CPU\n", __func__, e.what());
+        npu_ok = false;
+    }
+    const double t_npu = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+    const bool   cold  = ctx->npu_cold;
+    lock.unlock();
+
+    const bool cpu_ok = cpu.valid() ? cpu.get() : true;
+    if ((!npu_ok && !ggml_xdna_mul_mat_cpu(ctx, dst, 0, c)) || !cpu_ok) {
+        GGML_ABORT("%s: the CPU worker failed", __func__);
+    }
+
+    if (ggml_xdna_debug()) {
+        static int op_id = 0;
+        GGML_LOG_INFO("xdna_decode: op=%d feat=%" PRId64 " k=%" PRId64 " tok=%" PRId64 " npu_rows=%" PRId64 " kernel=%" PRId64 "x%" PRId64 "x%" PRId64 "%s t_npu_ms=%.3f cold=%d store_mb=%.0f\n",
+                      op_id++, n_feat, n_k, n_tok, c, dw->k->M, dw->k->K, dw->k->N, dw->k->w8 ? " int8" : "", t_npu, (int) cold,
+                      st.decode_bytes/1048576.0);
+    }
 }
 
 static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
@@ -1993,6 +2466,11 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
 
     // split the output features into consecutive ranges: NPU, Vulkan, CPU.
     ggml_xdna_state & st = ggml_xdna_get_state();
+
+    if (ne11 < st.min_batch) {
+        ggml_xdna_mul_mat_decode(ctx, dst);   // admitted only with GGML_XDNA_NPU_DECODE
+        return;
+    }
 
     // the NPU part is rounded to whole blocks of the kernel it will run on - a partial block
     // costs the NPU as much as a full one - so a small share can round down to nothing on a
@@ -2105,6 +2583,14 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
                 const double thr = (double) n[i]*ne11/(t[i]*1e3);
                 sp.thr[i]       = sp.thr[i]       > 0.0 ? 0.7*sp.thr[i]       + 0.3*thr      : thr;
                 ctx->mac_thr[i] = ctx->mac_thr[i] > 0.0 ? 0.9*ctx->mac_thr[i] + 0.1*thr*ne00 : thr*ne00;
+            }
+        }
+        // the NPU's correction to its kernel model on this shape
+        if (n[GGML_XDNA_WORKER_NPU] > 0 && t[GGML_XDNA_WORKER_NPU] > 0.0 && !ctx->npu_cold && !npu_first) {
+            const double model = ggml_xdna_npu_model_ms(st, src0, n[GGML_XDNA_WORKER_NPU], ne11)*ne12*ne13;
+            if (model > 0.0) {
+                const double corr = t[GGML_XDNA_WORKER_NPU]*1e3/model;
+                sp.npu_corr = sp.npu_corr > 0.0 ? 0.7*sp.npu_corr + 0.3*corr : corr;
             }
         }
     }
@@ -2258,7 +2744,7 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
             mode  = "explore";
         } else {
             mode = "auto";
-            const double corr = sp.moe_corr > 0.0 ? sp.moe_corr : 1.0;
+            const double corr = sp.npu_corr > 0.0 ? sp.npu_corr : 1.0;
             double best_t = (double) n_feat*n_pair/cpu_rate;
             for (int64_t c = step; ; c += step) {
                 c = std::min(c, n_feat);
@@ -2276,7 +2762,7 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
                 }
             }
             // as in the dense split: a dropped NPU is re-measured every 16th op
-            if (n_npu == 0 && sp.moe_corr > 0.0 && ++sp.npu_skips % 16 == 0) {
+            if (n_npu == 0 && sp.npu_corr > 0.0 && ++sp.npu_skips % 16 == 0) {
                 n_npu = std::min(step, n_feat);
             }
             t_pred = best_t;
@@ -2355,7 +2841,7 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
             const double model = npu_model_ms(n_npu);
             if (model > 0.0) {
                 const double corr = t_npu*1e3/model;
-                sp.moe_corr = sp.moe_corr > 0.0 ? 0.7*sp.moe_corr + 0.3*corr : corr;
+                sp.npu_corr = sp.npu_corr > 0.0 ? 0.7*sp.npu_corr + 0.3*corr : corr;
             }
         }
         if (n_npu > 0) {
@@ -2368,7 +2854,7 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
         GGML_LOG_INFO("xdna_moe: op=%d feat=%" PRId64 " k=%" PRId64 " experts=%" PRId64 "/%" PRId64 " pairs=%" PRId64
                       " rows=%" PRId64 "/%" PRId64 " t_ms=%.3f/%.3f mode=%s pred_ms=%.3f corr=%.2f cold=%d\n",
                       op_id++, n_feat, n_k, n_active, n_exp, n_pair, n_npu, n_feat - n_npu,
-                      t_npu*1e3, t_cpu*1e3, mode, t_pred, sp.moe_corr, (int) ctx->npu_cold);
+                      t_npu*1e3, t_cpu*1e3, mode, t_pred, sp.npu_corr, (int) ctx->npu_cold);
     }
 }
 
@@ -2584,14 +3070,19 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
             const int64_t n_feat = src0->ne[1];
             const int64_t n_tok  = src1->ne[1];
 
-            // per-launch overhead makes small products a loss; decode-sized (n_tok == 1) never qualifies
+            // per-launch overhead makes small products a loss: decode-sized ones (fewer than min_batch
+            // tokens) are only taken with GGML_XDNA_NPU_DECODE, on 2-D operands
             const int64_t min_dim = 32;
+            const bool    decode  = n_tok < st.min_batch;
+            const bool    size_ok = decode ? ggml_xdna_decode_share() > 0.0f && ggml_xdna_have_decode_kernels(st) &&
+                                             src0->ne[2]*src0->ne[3] == 1 && src1->ne[2]*src1->ne[3] == 1
+                                           : true;
 
             const bool ok = ggml_is_contiguous(src0) &&
                    ggml_is_contiguous(src1) &&
                    src1->type == GGML_TYPE_F32 &&
                    op->type   == GGML_TYPE_F32 &&
-                   (n_tok >= st.min_batch && n_k >= min_dim && n_feat >= min_dim) &&
+                   (size_ok && n_tok >= 1 && n_k >= min_dim && n_feat >= min_dim) &&
                    (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 ||
                     ggml_get_type_traits(src0->type)->to_float != NULL) &&
                    // repacked weights: only the layouts the NPU side can convert back (Q4_0, Q4_K; 8-row groups)
@@ -2599,7 +3090,7 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                     (ggml_xdna_repack_enabled() && ggml_n_dims(src0) == 2 && n_feat % 8 == 0 &&
                      ((src0->type == GGML_TYPE_Q4_0 && n_k % 32 == 0) || (src0->type == GGML_TYPE_Q4_K && n_k % 256 == 0))));
 
-            if (ok && ggml_xdna_is_weight(src0)) {
+            if (ok && !decode && ggml_xdna_is_weight(src0)) {
                 ggml_xdna_warm_enqueue(src0, n_tok);
             }
 

@@ -9,6 +9,9 @@
 #   --b-col-maj 1 --c-col-maj 1 --dtype_in bf16 --dtype_out f32
 # so that A = weight rows [M x K], B = activation rows [N x K], C = [N x M] (ggml dst layout).
 # Shapes must satisfy: M % (m*4) == 0, K % k == 0, N % (n*4) == 0, (M/m/4) % 2 == 0.
+# So a 256-row block needs m=32 (n=64 keeps the per-core tile as large as m=64,n=32 does), and N
+# must be a multiple of 256 with n=64. Launches cost ~180 us of dispatch on XDNA1 whatever their
+# size, so large N (whole 512-token batches) pays off.
 set -euo pipefail
 
 OUT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
@@ -17,8 +20,9 @@ DESIGN="$MLIR_AIE_DIR/programming_examples/basic/matrix_multiplication/whole_arr
 DEV="${XDNA_DEV:-npu}"     # npu = XDNA1 (Phoenix/Hawk Point), npu2 = XDNA2 (Strix)
 COLS="${XDNA_COLS:-4}"     # 4 columns on npu1
 
-# M x K x N  m k n
-SHAPES="${SHAPES:-512x512x128:64,64,32 512x1024x128:64,64,32 512x512x256:64,64,32}"
+# M x K x N  m k n   (the shipped mm_bf16_f32_M256_K512_N64 was built with SHAPES="256x512x64:32,32,16",
+# and the decode kernels (GGML_XDNA_NPU_DECODE) with SHAPES="1024x1024x64:64,64,16")
+SHAPES="${SHAPES:-512x1024x512:64,64,32 256x1024x512:32,64,64 512x1024x128:64,64,32}"
 
 mkdir -p "$OUT"
 for spec in $SHAPES; do
