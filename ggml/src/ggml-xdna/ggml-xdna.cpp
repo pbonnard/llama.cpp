@@ -177,6 +177,7 @@ struct ggml_xdna_state {
     std::map<const void *, bool>     warm_seen;
     std::atomic<bool>                warm_stop{false};
     float                            warm_share = 0.0f;   // expected NPU share of an op's rows (0: no warm-up)
+    bool                             warm_repacked_only = false;   // only weights in the CPU's repacked layout
     int                              n_backends = 0;
 
     // the NPU takes part in matmuls (it is off by default next to a GPU worker); mixture-of-experts
@@ -820,55 +821,68 @@ static uint64_t ggml_xdna_weight_sig(const void * data, size_t bytes, int type, 
     return h;
 }
 
-// device-resident copy of weight rows [feat0, feat1): cached across calls when within budget
+// device-resident copy of weight rows [feat0, feat1) for the Vulkan worker; *row0 receives the first
+// row the returned tensor holds (the caller takes a view of rows [feat0, feat1) when it holds more).
+// Model weights are copied whole, once, and cached: the auto split moves the worker's rows from op to
+// op, and caching per row range meant a new upload for nearly every op (Qwen3-0.6B Q8_0 with auto:
+// 808 t/s against 976 with a fixed split). Anything else, or beyond the budget, is copied per call.
 static ggml_tensor * ggml_xdna_vk_weight_slice(ggml_backend_xdna_context * ctx, const ggml_tensor * src0, int64_t feat0, int64_t feat1,
-                                               ggml_backend_xdna_context::vk_weight & temp, bool & cached) {
-    const int64_t n_rows = feat1 - feat0;
-    const char *  data   = (const char *) src0->data + feat0*src0->nb[1];
-    const size_t  bytes  = n_rows*src0->nb[1];
-    const uint64_t sig   = ggml_xdna_weight_sig(data, bytes, src0->type, src0->ne[0]);
-
-    const auto key = std::make_tuple((const void *) src0->data, feat0, feat1);
-    const bool cacheable = ggml_xdna_is_weight(src0);   // never cache activations (e.g. KV views)
-    auto it = cacheable ? ctx->vk_weights.find(key) : ctx->vk_weights.end();
-    if (it != ctx->vk_weights.end()) {
-        if (it->second.sig == sig) {
-            cached = true;
-            return it->second.a;
+                                               ggml_backend_xdna_context::vk_weight & temp, bool & cached, int64_t & row0) {
+    auto upload = [&](int64_t r0, int64_t r1, uint64_t sig, ggml_backend_xdna_context::vk_weight & w) {
+        struct ggml_init_params ip = {
+            /* .mem_size   = */ ggml_tensor_overhead()*2,
+            /* .mem_buffer = */ NULL,
+            /* .no_alloc   = */ true,
+        };
+        w.wctx  = ggml_init(ip);
+        w.a     = ggml_new_tensor_2d(w.wctx, src0->type, src0->ne[0], r1 - r0);
+        w.buf   = ggml_backend_alloc_ctx_tensors(w.wctx, ctx->vk);
+        w.sig   = sig;
+        w.bytes = (r1 - r0)*src0->nb[1];
+        if (w.buf == nullptr) {
+            ggml_free(w.wctx);
+            return false;
         }
-        // the address was reused by different weights: drop the stale copy
-        ggml_backend_buffer_free(it->second.buf);
-        ggml_free(it->second.wctx);
-        ctx->vk_weight_bytes -= it->second.bytes;
-        ctx->vk_weights.erase(it);
+        ggml_backend_tensor_set(w.a, (const char *) src0->data + r0*src0->nb[1], 0, w.bytes);
+        return true;
+    };
+
+    if (ggml_xdna_is_weight(src0)) {   // never cache activations (e.g. KV views)
+        const int64_t  n_all = src0->ne[1];
+        const uint64_t sig   = ggml_xdna_weight_sig(src0->data, n_all*src0->nb[1], src0->type, src0->ne[0]);
+        const auto     key   = std::make_tuple((const void *) src0->data, (int64_t) 0, n_all);
+        auto it = ctx->vk_weights.find(key);
+        if (it != ctx->vk_weights.end()) {
+            if (it->second.sig == sig) {
+                cached = true;
+                row0   = 0;
+                return it->second.a;
+            }
+            // the address was reused by different weights: drop the stale copy
+            ggml_backend_buffer_free(it->second.buf);
+            ggml_free(it->second.wctx);
+            ctx->vk_weight_bytes -= it->second.bytes;
+            ctx->vk_weights.erase(it);
+        }
+        if (ctx->vk_weight_bytes + n_all*src0->nb[1] <= ctx->vk_weight_limit) {
+            ggml_backend_xdna_context::vk_weight w;
+            if (upload(0, n_all, sig, w)) {
+                ctx->vk_weights[key] = w;
+                ctx->vk_weight_bytes += w.bytes;
+                cached = true;
+                row0   = 0;
+                return w.a;
+            }
+        }
     }
 
-    struct ggml_init_params ip = {
-        /* .mem_size   = */ ggml_tensor_overhead()*2,
-        /* .mem_buffer = */ NULL,
-        /* .no_alloc   = */ true,
-    };
-    ggml_backend_xdna_context::vk_weight w;
-    w.wctx  = ggml_init(ip);
-    w.a     = ggml_new_tensor_2d(w.wctx, src0->type, src0->ne[0], n_rows);
-    w.buf   = ggml_backend_alloc_ctx_tensors(w.wctx, ctx->vk);
-    w.sig   = sig;
-    w.bytes = bytes;
-    if (w.buf == nullptr) {
-        ggml_free(w.wctx);
+    // just the slice, freed by the caller after the compute
+    if (!upload(feat0, feat1, 0, temp)) {
         return nullptr;
     }
-    ggml_backend_tensor_set(w.a, data, 0, bytes);
-
-    if (cacheable && ctx->vk_weight_bytes + bytes <= ctx->vk_weight_limit) {
-        ctx->vk_weights[key] = w;
-        ctx->vk_weight_bytes += bytes;
-        cached = true;
-    } else {
-        temp   = w;   // caller frees after the compute
-        cached = false;
-    }
-    return w.a;
+    cached = false;
+    row0   = feat0;
+    return temp.a;
 }
 
 // page-aligned host scratch for the Vulkan worker's result, grown on demand; the old block's
@@ -932,9 +946,10 @@ static bool ggml_xdna_mul_mat_vk_zero_copy(ggml_backend_xdna_context * ctx, stru
     const double t_import = ms_since(t0);
 
     ggml_backend_xdna_context::vk_weight temp;
-    bool cached = false;
-    ggml_tensor * a = ggml_xdna_vk_weight_slice(ctx, src0, feat0, feat1, temp, cached);
-    if (a == nullptr) {
+    bool    cached = false;
+    int64_t row0   = 0;
+    ggml_tensor * w = ggml_xdna_vk_weight_slice(ctx, src0, feat0, feat1, temp, cached, row0);
+    if (w == nullptr) {
         return false;
     }
     const double t_weights = ms_since(t0);
@@ -946,10 +961,19 @@ static bool ggml_xdna_mul_mat_vk_zero_copy(ggml_backend_xdna_context * ctx, stru
     };
     ggml_context * gctx = ggml_init(ip);
 
+    // rows [feat0, feat1) of the device copy: the whole copy, or a view into a cached whole weight
+    // (the split's row boundaries are multiples of 64 rows, so the view stays storage-buffer aligned)
+    ggml_tensor * a = w;
+    bool ok = true;
+    if (w->ne[1] != n_rows) {
+        a  = ggml_view_2d(gctx, w, w->ne[0], n_rows, w->nb[1], (size_t) (feat0 - row0)*w->nb[1]);
+        ok = ggml_backend_view_init(a) == GGML_STATUS_SUCCESS;
+    }
+
     ggml_tensor * b = ggml_new_tensor_2d(gctx, src1->type, src1->ne[0], src1->ne[1]);
     ggml_tensor * c = ggml_mul_mat(gctx, a, b);
 
-    bool ok = ggml_backend_supports_op(vk, c) &&
+    ok = ok && ggml_backend_supports_op(vk, c) &&
               ggml_backend_tensor_alloc(buf_b, b, addr_b) == GGML_STATUS_SUCCESS &&
               ggml_backend_tensor_alloc(buf_c, c, addr_c) == GGML_STATUS_SUCCESS;
     if (ok) {
@@ -1004,15 +1028,16 @@ static void ggml_xdna_init_shares(ggml_backend_xdna_context * ctx) {
     const bool have_cpu = ggml_xdna_cpu_backend(ctx) != nullptr;
 
     // measured on a Ryzen 7 8700G: the 780M (Vulkan) is ~10x the 4-column XDNA1 at batched
-    // GEMM and the 8 Zen 4 cores sit in between, so next to the GPU worker the NPU only ever
-    // lengthened the critical path (Qwen3-0.6B and gemma-4-E2B, 476 tokens). It therefore stays
-    // out by default when a GPU worker exists; GGML_XDNA_NPU_SHARE opts it back in, and
-    // GGML_XDNA_NPU_MIN_GFLOP keeps it to the large products where it has a chance.
+    // GEMM and the 8 Zen 4 cores sit in between, so on the weights the GPU worker can read the
+    // NPU rarely shortens an op: GGML_XDNA_NPU_MIN_GFLOP keeps it to the large products there.
+    // The first measurements start without it next to a GPU worker.
     float npu = have_vk ? 0.0f : 0.4f;
     float vkf = have_vk ? 0.8f : 0.0f;
-    // without a GPU the split is chosen per operation from measured speeds (auto, see
-    // ggml_xdna_plan_auto); the 0.4 / 0.6 shares only serve the first measurement
-    ctx->share_fixed = have_vk;
+    // the split is chosen per operation from measured speeds (auto, see ggml_xdna_plan_auto); the
+    // shares above only serve the first measurements. Next to a GPU worker the NPU still pays off
+    // on the CPU's repacked weights, which the GPU worker cannot read (Qwen3-0.6B Q4_0, -ngl 0:
+    // 892 t/s with auto vs 626 with the fixed NPU 0 / Vulkan 0.8 / CPU 0.2 split)
+    ctx->share_fixed = false;
     ctx->npu_min_gflop = have_vk ? 4.0 : 0.0;
     if (const char * env = ggml_xdna_getenv("GGML_XDNA_NPU_MIN_GFLOP")) {
         ctx->npu_min_gflop = std::max(0.0, std::atof(env));
@@ -1992,7 +2017,8 @@ static void ggml_xdna_warm_enqueue(const ggml_tensor * src0, int64_t n_tok) {
         return;
     }
     std::lock_guard<std::mutex> lock(st.warm_mutex);
-    if (st.warm_stop || st.warm_share <= 0.0f || st.warm_seen.count(src0->data) != 0) {
+    if (st.warm_stop || st.warm_share <= 0.0f || st.warm_seen.count(src0->data) != 0 ||
+        (st.warm_repacked_only && !ggml_xdna_is_cpu_repack(src0))) {
         return;
     }
     st.warm_seen[src0->data] = true;
@@ -2023,7 +2049,7 @@ static float ggml_xdna_warm_share(const ggml_backend_xdna_context * ctx) {
     if (ctx->share_fixed) {
         return ctx->share[GGML_XDNA_WORKER_NPU];
     }
-    return ctx->vk != nullptr ? 0.0f : 0.5f;
+    return 0.5f;
 }
 
 static void ggml_xdna_warm_acquire(const ggml_backend_xdna_context * ctx) {
@@ -2034,6 +2060,9 @@ static void ggml_xdna_warm_acquire(const ggml_backend_xdna_context * ctx) {
     if (st.n_backends++ == 0) {
         st.warm_share = share;
         st.warm_stop  = share <= 0.0f;
+        // next to a GPU worker with the auto split, the NPU mostly takes the CPU's repacked weights
+        // (the GPU worker reads the others faster): only those are converted ahead
+        st.warm_repacked_only = !ctx->share_fixed && ctx->vk != nullptr;
     }
 }
 
