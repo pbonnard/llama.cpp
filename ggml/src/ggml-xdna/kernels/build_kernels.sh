@@ -22,7 +22,7 @@ COLS="${XDNA_COLS:-4}"     # 4 columns on npu1
 
 # M x K x N  m k n   (the shipped mm_bf16_f32_M256_K512_N64 was built with SHAPES="256x512x64:32,32,16",
 # and the decode kernels (GGML_XDNA_NPU_DECODE) with SHAPES="1024x1024x64:64,64,16")
-SHAPES="${SHAPES:-512x1024x512:64,64,32 256x1024x512:32,64,64 512x1024x128:64,64,32}"
+SHAPES="${SHAPES:-512x1024x512:64,64,32 256x1024x512:32,64,64 512x1024x128:64,64,32 512x1536x512:64,64,32 512x2048x512:64,64,32}"
 
 mkdir -p "$OUT"
 for spec in $SHAPES; do
@@ -41,7 +41,8 @@ done
 # int8-weight kernels (A = int8 weight rows, B = bf16 activation rows, C = f32): same layouts, half the
 # weight bytes; the host applies the per-row, per-block weight scales. Design: whole_array_w8.py + mm_w8.cc.
 W8_DESIGN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/whole_array_w8.py"
-W8_SHAPES="${W8_SHAPES:-$SHAPES}"
+# int8 weights keep one scale per 1,024 inputs, so their K must divide 1,024
+W8_SHAPES="${W8_SHAPES:-512x1024x512:64,64,32 256x1024x512:32,64,64 512x1024x128:64,64,32}"
 for spec in $W8_SHAPES; do
   dims="${spec%%:*}"; tile="${spec##*:}"
   M="${dims%%x*}"; rest="${dims#*x}"; K="${rest%%x*}"; N="${rest##*x}"

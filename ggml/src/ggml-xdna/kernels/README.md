@@ -52,6 +52,14 @@ Shipped kernels (XDNA1, 4 columns, bf16 in / f32 out):
 | `mm_bf16_f32_M256_K1024_N512` | 256 x 1024 x 512 | 32,64,64 | 303 us | the same, in 256-row steps of a matrix |
 | `mm_bf16_f32_M512_K1024_N128` | 512 x 1024 x 128 | 64,64,32 | 239 us | smaller batches |
 | `mm_bf16_f32_M256_K512_N64`   | 256 x 512 x 64   | 32,32,16 | 179 us | small batches / narrow layers |
+| `mm_bf16_f32_M512_K1536_N512` | 512 x 1536 x 512 | 64,64,32 | 573 us | 1,536 / 3,072-wide inputs (bf16 weights only) |
+| `mm_bf16_f32_M512_K2048_N512` | 512 x 2048 x 512 | 64,64,32 | 723 us | inputs 2,048 wide or more (bf16 weights only) |
+
+The two wide kernels take 16-20% less time per MAC than K = 1,024 blocks and fit 1,536-wide
+models without padding: gemma-4-E2B prefill 305 -> 331 t/s, Qwen3-0.6B ~880 -> 900-950. Adding
+M256 and K = 2,560 variants too (llama3.2:3b +5%) would make every model load 5 kernels, the
+whole hardware-context budget below, so they are not shipped. int8-weight kernels stay at
+K = 1,024, since those weights keep one scale per 1,024 inputs.
 
 Launch times: Ryzen 7 8700G, `pyxrt`, median of 50 launches, NMSE ~1e-14 against the bf16
 reference. A launch costs ~180 us of dispatch whatever its size, plus ~1 TMAC/s of compute, so
