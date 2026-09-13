@@ -171,6 +171,51 @@ NPU gives the same logits from repacked weights as from `--no-repack` (KL diverg
   at a time wastes almost all of it.
 - On an APU, keeping the whole model on the integrated GPU is by far the fastest option when it fits in memory.
 
+### Benchmark method
+
+Prompt processing, the main measurement:
+
+```sh
+llama-bench -m model.gguf -p 512 -n 0 -r 3 -t 8 -ngl 0
+```
+
+- `-p 512`: one 512-token prompt, exactly one llama.cpp micro-batch and the NPU kernels' token block; `-n 0`: no
+  generation, so the number is pure prompt processing.
+- `-r 3`: three timed repetitions (five in the earliest measurements), after llama-bench's own untimed warm-up run,
+  so the NPU's kernels are loaded and its weight cache is filled: the numbers are warm.
+- `-t 8`: the Ryzen 7 8700G's eight physical cores. `-ngl 0` keeps the layers on the CPU, so the XDNA backend gets
+  the matrix multiplies. Everything else is at llama-bench's defaults (batch 2048, micro-batch 512).
+- Vulkan build: `-ngl 0 -dev none` for the GPUs off, `-ngl 99 -dev Vulkan1` for the whole model on the 780M.
+- Token generation: `llama-bench -m model.gguf -p 0 -n 64 -r 3 -t 8 -ngl 0`.
+- The llama-server numbers come from server-manager: a fresh server per configuration (`-ngl 0 --ctx-size 8192`,
+  f16 KV cache), one warm-up request, then three measured requests with the same 2,134-token prompt.
+
+Configurations are selected with environment variables, the same binary throughout:
+
+| configuration | environment |
+|---|---|
+| CPU alone (stock llama.cpp CPU path, repacked weights) | `GGML_XDNA_MIN_BATCH=1000000` (the backend claims nothing) |
+| CPU + NPU, defaults | none (`auto` split, bf16 weights) |
+| fixed NPU share | `GGML_XDNA_NPU_SHARE=0.4` (or `0`, `1`, …) |
+| int8 NPU weights | `GGML_XDNA_NPU_W8=1` |
+| NPU token generation | `GGML_XDNA_NPU_DECODE=1` |
+
+The configurations being compared run interleaved, in two or three passes, on an otherwise idle machine, and are
+only compared within one run: run-to-run drift on this machine is about 10%.
+
+Accuracy is the KL divergence against the stock CPU's results, over 8 × 512 tokens of llama.cpp's own documentation:
+
+```sh
+GGML_XDNA_MIN_BATCH=1000000 llama-perplexity -m model.gguf -f text.txt -c 512 --chunks 8 -b 512 -t 8 \
+    --kl-divergence-base base.bin                                     # reference: stock CPU
+llama-perplexity -m model.gguf -c 512 --chunks 8 -b 512 -t 8 \
+    --kl-divergence-base base.bin --kl-divergence                     # configuration under test
+```
+
+The CPU's own `--no-repack` path against its repacked path gives the noise floor. Every NPU kernel is also checked
+on its own through pyxrt (`ggml/src/ggml-xdna/kernels/npu_smoke.py`), and `test-backend-ops -b XDNA -o MUL_MAT` /
+`-o MUL_MAT_ID` checks the backend against the CPU reference.
+
 ## Building (Windows)
 
 Requirements: the AMD NPU driver (it provides XRT, `xrt_coreutil.dll`), Visual Studio 2022 or later with C++, CMake
