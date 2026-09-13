@@ -60,6 +60,18 @@ large blocks win: one 512 x 1024 x 512 launch does the work of four 512 x 1024 x
 of a 1,024-row matrix instead of none, half or all of it. With these kernels the NPU alone
 prefills Qwen3-0.6B at ~815 t/s (it managed ~370 with 128-token blocks).
 
+### Weight formats
+
+The NPU never computes on quantized weights: the host converts the rows it takes to bf16 (or int8
+with `GGML_XDNA_NPU_W8=1`) once, with ggml's own dequantizers, and keeps them in the weight cache.
+Every ggml weight type with a dequantizer works: F32, F16, BF16 (used in place), the legacy and
+K-quants, the IQ types and MXFP4. On x86 the CPU backend re-lays out some types for its SIMD
+kernels (`CPU_REPACK`: rows in groups of 8, quants interleaved in 8-byte chunks); the backend
+converts those layouts back for Q4_0, Q4_K, Q2_K (repacked on AVX-512 CPUs), IQ4_NL and MXFP4,
+which covers every type the x86 CPU backend repacks. The conversion is exact: with the NPU taking
+all rows, a model's repacked weights give the same logits as `--no-repack` (KL divergence 0 on
+Qwen3-0.6B requantized to Q2_K, IQ4_NL and MXFP4).
+
 ### Decode kernels (experimental, `GGML_XDNA_NPU_DECODE`)
 
 ```

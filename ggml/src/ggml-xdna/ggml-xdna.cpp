@@ -1171,48 +1171,16 @@ static void ggml_xdna_rows_to_bf16(ggml_backend_xdna_context * ctx, const ggml_t
     });
 }
 
-// CPU_REPACK Q4_0 layout on x86 (block_q4_0x8, see make_block_q4_0x8 in ggml-cpu/repack.cpp): each
-// group of 8 rows is stored as one block_q4_0x8 per 32-wide column block, holding the 8 rows'
-// scales and their quants interleaved in 8-byte chunks, xor 0x88
-struct ggml_xdna_block_q4_0   { ggml_fp16_t d;    uint8_t qs[16];  };
-struct ggml_xdna_block_q4_0x8 { ggml_fp16_t d[8]; uint8_t qs[128]; };
-static_assert(sizeof(ggml_xdna_block_q4_0)   == 18,  "unexpected block_q4_0 size");
-static_assert(sizeof(ggml_xdna_block_q4_0x8) == 144, "unexpected block_q4_0x8 size");
-
-// convert rows [row0, row0 + n_rows) (multiples of 8) of a CPU_REPACK Q4_0 tensor to bf16
-static void ggml_xdna_repacked_q4_0_rows_to_bf16(ggml_backend_xdna_context * ctx, const ggml_tensor * t,
-                                                 int64_t row0, int64_t n_rows, ggml_bf16_t * dst, int64_t dst_stride) {
-    const int64_t ne0     = t->ne[0];
-    const int64_t nblocks = ne0/32;
-    const ggml_to_float_t to_float = ggml_get_type_traits(GGML_TYPE_Q4_0)->to_float;
-
-    ggml_xdna_parallel_for(ctx, n_rows/8, 2, [&](int64_t g0, int64_t g1) {
-        std::vector<ggml_xdna_block_q4_0> rows(8*nblocks);   // the group's 8 rows as plain q4_0
-        std::vector<float> tmp(ne0);
-        for (int64_t g = g0; g < g1; g++) {
-            const auto * src = (const ggml_xdna_block_q4_0x8 *) ((const char *) t->data + (row0 + 8*g)*t->nb[1]);
-            for (int64_t x = 0; x < nblocks; x++) {
-                for (int r = 0; r < 8; r++) {
-                    rows[r*nblocks + x].d = src[x].d[r];
-                }
-                for (int c = 0; c < 16; c++) {
-                    uint64_t q;
-                    std::memcpy(&q, &src[x].qs[8*c], sizeof(q));
-                    q ^= 0x8888888888888888ULL;
-                    std::memcpy(&rows[(c % 8)*nblocks + x].qs[8*(c / 8)], &q, sizeof(q));
-                }
-            }
-            for (int r = 0; r < 8; r++) {
-                to_float(&rows[r*nblocks], tmp.data(), ne0);
-                ggml_fp32_to_bf16_row(tmp.data(), dst + (8*g + r)*dst_stride, ne0);
-            }
-        }
-    });
-}
-
-// CPU_REPACK Q4_K layout on x86 (block_q4_Kx8, see make_block_q4_Kx8 in ggml-cpu/repack.cpp): per
-// 256-wide column block of an 8-row group, the rows' d/dmin, their quants interleaved in 8-byte
-// chunks (no xor), and their 6-bit sub-block scales/mins regrouped as 12 bytes per sub-block
+// CPU_REPACK layouts on x86 (the 8x8 variants of ggml-cpu/repack.cpp, make_block_*x8): rows are
+// stored in groups of 8, and each column block of a group as one interleaved block holding the 8
+// rows' scales and their quants, which rotate through the rows in 8-byte chunks. A converter
+// rebuilds the group's 8 plain blocks and runs ggml's own dequantizer on them.
+struct ggml_xdna_block_q4_0    { ggml_fp16_t d;    uint8_t qs[16];  };
+struct ggml_xdna_block_q4_0x8  { ggml_fp16_t d[8]; uint8_t qs[128]; };
+struct ggml_xdna_block_iq4_nl  { ggml_fp16_t d;    uint8_t qs[16];  };
+struct ggml_xdna_block_iq4_nlx8{ ggml_fp16_t d[8]; uint8_t qs[128]; };
+struct ggml_xdna_block_mxfp4   { uint8_t     e;    uint8_t qs[16];  };
+struct ggml_xdna_block_mxfp4x8 { uint8_t     e[8]; uint8_t qs[128]; };
 struct ggml_xdna_block_q4_K {
     ggml_fp16_t d;
     ggml_fp16_t dmin;
@@ -1225,48 +1193,60 @@ struct ggml_xdna_block_q4_Kx8 {
     uint8_t     scales[96];
     uint8_t     qs[1024];
 };
-static_assert(sizeof(ggml_xdna_block_q4_K)   == 144,  "unexpected block_q4_K size");
-static_assert(sizeof(ggml_xdna_block_q4_Kx8) == 1152, "unexpected block_q4_Kx8 size");
+struct ggml_xdna_block_q2_K {
+    uint8_t     scales[16];
+    uint8_t     qs[64];
+    ggml_fp16_t d;
+    ggml_fp16_t dmin;
+};
+struct ggml_xdna_block_q2_Kx8 {
+    ggml_fp16_t d[8];
+    ggml_fp16_t dmin[8];
+    uint8_t     scales[128];
+    uint8_t     qs[512];
+};
+static_assert(sizeof(ggml_xdna_block_q4_0)     == 18,   "unexpected block_q4_0 size");
+static_assert(sizeof(ggml_xdna_block_q4_0x8)   == 144,  "unexpected block_q4_0x8 size");
+static_assert(sizeof(ggml_xdna_block_iq4_nl)   == 18,   "unexpected block_iq4_nl size");
+static_assert(sizeof(ggml_xdna_block_iq4_nlx8) == 144,  "unexpected block_iq4_nlx8 size");
+static_assert(sizeof(ggml_xdna_block_mxfp4)    == 17,   "unexpected block_mxfp4 size");
+static_assert(sizeof(ggml_xdna_block_mxfp4x8)  == 136,  "unexpected block_mxfp4x8 size");
+static_assert(sizeof(ggml_xdna_block_q4_K)     == 144,  "unexpected block_q4_K size");
+static_assert(sizeof(ggml_xdna_block_q4_Kx8)   == 1152, "unexpected block_q4_Kx8 size");
+static_assert(sizeof(ggml_xdna_block_q2_K)     == 84,   "unexpected block_q2_K size");
+static_assert(sizeof(ggml_xdna_block_q2_Kx8)   == 672,  "unexpected block_q2_Kx8 size");
 
-// convert rows [row0, row0 + n_rows) (multiples of 8) of a CPU_REPACK Q4_K tensor to bf16
-static void ggml_xdna_repacked_q4_K_rows_to_bf16(ggml_backend_xdna_context * ctx, const ggml_tensor * t,
-                                                 int64_t row0, int64_t n_rows, ggml_bf16_t * dst, int64_t dst_stride) {
+// the quants of 8 plain blocks from an interleaved block of n_bytes: chunk c (8 bytes) belongs to
+// row c % 8, at byte 8*(c / 8) of its block; Q4_0 also stores its nibbles xor 0x88
+template <typename block_plain>
+static void ggml_xdna_deinterleave_qs(block_plain * const out[8], const uint8_t * in, int n_bytes, uint64_t xor_mask = 0) {
+    for (int c = 0; c < n_bytes/8; c++) {
+        uint64_t q;
+        std::memcpy(&q, in + 8*c, sizeof(q));
+        q ^= xor_mask;
+        std::memcpy(&out[c % 8]->qs[8*(c / 8)], &q, sizeof(q));
+    }
+}
+
+// convert rows [row0, row0 + n_rows) (multiples of 8) of a CPU_REPACK tensor with qk-wide column
+// blocks to bf16; unpack(in, out) rebuilds the 8 plain blocks out[r] of interleaved block in
+template <typename block_x8, typename block_plain, typename F>
+static void ggml_xdna_repacked_rows_to_bf16(ggml_backend_xdna_context * ctx, const ggml_tensor * t, int64_t qk,
+                                            int64_t row0, int64_t n_rows, ggml_bf16_t * dst, int64_t dst_stride, F && unpack) {
     const int64_t ne0     = t->ne[0];
-    const int64_t nblocks = ne0/256;
-    const ggml_to_float_t to_float = ggml_get_type_traits(GGML_TYPE_Q4_K)->to_float;
+    const int64_t nblocks = ne0/qk;
+    const ggml_to_float_t to_float = ggml_get_type_traits(t->type)->to_float;
 
     ggml_xdna_parallel_for(ctx, n_rows/8, 2, [&](int64_t g0, int64_t g1) {
-        std::vector<ggml_xdna_block_q4_K> rows(8*nblocks);   // the group's 8 rows as plain q4_K
+        std::vector<block_plain> rows(8*nblocks);   // the group's 8 rows as plain blocks
         std::vector<float> tmp(ne0);
         for (int64_t g = g0; g < g1; g++) {
-            const auto * src = (const ggml_xdna_block_q4_Kx8 *) ((const char *) t->data + (row0 + 8*g)*t->nb[1]);
+            const auto * src = (const block_x8 *) ((const char *) t->data + (row0 + 8*g)*t->nb[1]);
             for (int64_t x = 0; x < nblocks; x++) {
-                const ggml_xdna_block_q4_Kx8 & in = src[x];
-                for (int c = 0; c < 128; c++) {
-                    std::memcpy(&rows[(c % 8)*nblocks + x].qs[8*(c / 8)], &in.qs[8*c], 8);
-                }
-                // 6-bit scale and min of sub-block s for row r
-                uint8_t sc[8][8], mn[8][8];
-                for (int s = 0; s < 8; s++) {
-                    const uint8_t * p = in.scales + (s < 4 ? 12*s : 48 + 12*(s - 4));
-                    for (int j = 0; j < 4; j++) {
-                        sc[j][s]     = p[j] & 63;
-                        mn[j][s]     = p[4 + j] & 63;
-                        sc[j + 4][s] = (p[8 + j] & 15) | ((p[j] >> 6) << 4);
-                        mn[j + 4][s] = (p[8 + j] >> 4) | ((p[4 + j] >> 6) << 4);
-                    }
-                }
-                // re-pack them in block_q4_K's 12-byte form (the inverse of get_scale_min_k4)
-                for (int r = 0; r < 8; r++) {
-                    ggml_xdna_block_q4_K & b = rows[r*nblocks + x];
-                    b.d    = in.d[r];
-                    b.dmin = in.dmin[r];
-                    for (int j = 0; j < 4; j++) {
-                        b.scales[j]     = (uint8_t) (sc[r][j] | ((sc[r][j + 4] >> 4) << 6));
-                        b.scales[j + 4] = (uint8_t) (mn[r][j] | ((mn[r][j + 4] >> 4) << 6));
-                        b.scales[j + 8] = (uint8_t) ((sc[r][j + 4] & 15) | ((mn[r][j + 4] & 15) << 4));
-                    }
-                }
+                block_plain * const out[8] = {
+                    &rows[0*nblocks + x], &rows[1*nblocks + x], &rows[2*nblocks + x], &rows[3*nblocks + x],
+                    &rows[4*nblocks + x], &rows[5*nblocks + x], &rows[6*nblocks + x], &rows[7*nblocks + x] };
+                unpack(src[x], out);
             }
             for (int r = 0; r < 8; r++) {
                 to_float(&rows[r*nblocks], tmp.data(), ne0);
@@ -1274,6 +1254,86 @@ static void ggml_xdna_repacked_q4_K_rows_to_bf16(ggml_backend_xdna_context * ctx
             }
         }
     });
+}
+
+// block_q4_0x8 (make_block_q4_0x8): 8 scales, quants xor 0x88
+static void ggml_xdna_unpack_q4_0x8(const ggml_xdna_block_q4_0x8 & in, ggml_xdna_block_q4_0 * const out[8]) {
+    for (int r = 0; r < 8; r++) {
+        out[r]->d = in.d[r];
+    }
+    ggml_xdna_deinterleave_qs(out, in.qs, sizeof(in.qs), 0x8888888888888888ULL);
+}
+
+// block_iq4_nlx8 (make_block_iq4_nlx8): 8 scales, quants as stored
+static void ggml_xdna_unpack_iq4_nlx8(const ggml_xdna_block_iq4_nlx8 & in, ggml_xdna_block_iq4_nl * const out[8]) {
+    for (int r = 0; r < 8; r++) {
+        out[r]->d = in.d[r];
+    }
+    ggml_xdna_deinterleave_qs(out, in.qs, sizeof(in.qs));
+}
+
+// block_mxfp4x8 (make_block_mxfp4x8): 8 E8M0 exponents, quants as stored
+static void ggml_xdna_unpack_mxfp4x8(const ggml_xdna_block_mxfp4x8 & in, ggml_xdna_block_mxfp4 * const out[8]) {
+    for (int r = 0; r < 8; r++) {
+        out[r]->e = in.e[r];
+    }
+    ggml_xdna_deinterleave_qs(out, in.qs, sizeof(in.qs));
+}
+
+// block_q2_Kx8 (make_block_q2_Kx8): d/dmin, quants as stored, and the 4-bit scale/min bytes
+// regrouped so that scales[i] holds byte (i / 16)*2 + i % 2 of row (i % 16) / 2
+static void ggml_xdna_unpack_q2_Kx8(const ggml_xdna_block_q2_Kx8 & in, ggml_xdna_block_q2_K * const out[8]) {
+    for (int r = 0; r < 8; r++) {
+        out[r]->d    = in.d[r];
+        out[r]->dmin = in.dmin[r];
+    }
+    ggml_xdna_deinterleave_qs(out, in.qs, sizeof(in.qs));
+    for (int i = 0; i < 128; i++) {
+        out[(i % 16)/2]->scales[(i / 16)*2 + i % 2] = in.scales[i];
+    }
+}
+
+// block_q4_Kx8 (make_block_q4_Kx8): d/dmin, quants as stored, and the 6-bit sub-block scales/mins
+// regrouped as 12 bytes per sub-block
+static void ggml_xdna_unpack_q4_Kx8(const ggml_xdna_block_q4_Kx8 & in, ggml_xdna_block_q4_K * const out[8]) {
+    ggml_xdna_deinterleave_qs(out, in.qs, sizeof(in.qs));
+    // 6-bit scale and min of sub-block s for row r
+    uint8_t sc[8][8], mn[8][8];
+    for (int s = 0; s < 8; s++) {
+        const uint8_t * p = in.scales + (s < 4 ? 12*s : 48 + 12*(s - 4));
+        for (int j = 0; j < 4; j++) {
+            sc[j][s]     = p[j] & 63;
+            mn[j][s]     = p[4 + j] & 63;
+            sc[j + 4][s] = (p[8 + j] & 15) | ((p[j] >> 6) << 4);
+            mn[j + 4][s] = (p[8 + j] >> 4) | ((p[4 + j] >> 6) << 4);
+        }
+    }
+    // re-pack them in block_q4_K's 12-byte form (the inverse of get_scale_min_k4)
+    for (int r = 0; r < 8; r++) {
+        ggml_xdna_block_q4_K & b = *out[r];
+        b.d    = in.d[r];
+        b.dmin = in.dmin[r];
+        for (int j = 0; j < 4; j++) {
+            b.scales[j]     = (uint8_t) (sc[r][j] | ((sc[r][j + 4] >> 4) << 6));
+            b.scales[j + 4] = (uint8_t) (mn[r][j] | ((mn[r][j + 4] >> 4) << 6));
+            b.scales[j + 8] = (uint8_t) ((sc[r][j + 4] & 15) | ((mn[r][j + 4] & 15) << 4));
+        }
+    }
+}
+
+// repacked types the NPU side can convert back, for a row length of n_k
+static bool ggml_xdna_repacked_type_supported(enum ggml_type type, int64_t n_k) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_MXFP4:
+            return n_k % 32 == 0;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q2_K:
+            return n_k % 256 == 0;
+        default:
+            return false;
+    }
 }
 
 // GGML_XDNA_W8_EMULATE=<group>: round the NPU's bf16 weights through int8, with one scale per row
@@ -1321,8 +1381,26 @@ static void ggml_xdna_weight_rows_to_bf16(ggml_backend_xdna_context * ctx, const
     if (ggml_xdna_is_cpu_repack(src0)) {
         GGML_ASSERT(row0 % 8 == 0 && n_rows % 8 == 0 && i02 == 0 && i03 == 0);
         switch (src0->type) {
-            case GGML_TYPE_Q4_0: ggml_xdna_repacked_q4_0_rows_to_bf16(ctx, src0, row0, n_rows, dst, dst_stride); break;
-            case GGML_TYPE_Q4_K: ggml_xdna_repacked_q4_K_rows_to_bf16(ctx, src0, row0, n_rows, dst, dst_stride); break;
+            case GGML_TYPE_Q4_0:
+                ggml_xdna_repacked_rows_to_bf16<ggml_xdna_block_q4_0x8, ggml_xdna_block_q4_0>(
+                    ctx, src0, 32, row0, n_rows, dst, dst_stride, ggml_xdna_unpack_q4_0x8);
+                break;
+            case GGML_TYPE_IQ4_NL:
+                ggml_xdna_repacked_rows_to_bf16<ggml_xdna_block_iq4_nlx8, ggml_xdna_block_iq4_nl>(
+                    ctx, src0, 32, row0, n_rows, dst, dst_stride, ggml_xdna_unpack_iq4_nlx8);
+                break;
+            case GGML_TYPE_MXFP4:
+                ggml_xdna_repacked_rows_to_bf16<ggml_xdna_block_mxfp4x8, ggml_xdna_block_mxfp4>(
+                    ctx, src0, 32, row0, n_rows, dst, dst_stride, ggml_xdna_unpack_mxfp4x8);
+                break;
+            case GGML_TYPE_Q4_K:
+                ggml_xdna_repacked_rows_to_bf16<ggml_xdna_block_q4_Kx8, ggml_xdna_block_q4_K>(
+                    ctx, src0, 256, row0, n_rows, dst, dst_stride, ggml_xdna_unpack_q4_Kx8);
+                break;
+            case GGML_TYPE_Q2_K:
+                ggml_xdna_repacked_rows_to_bf16<ggml_xdna_block_q2_Kx8, ggml_xdna_block_q2_K>(
+                    ctx, src0, 256, row0, n_rows, dst, dst_stride, ggml_xdna_unpack_q2_Kx8);
+                break;
             default: GGML_ABORT("%s: unsupported repacked type %s", __func__, ggml_type_name(src0->type));
         }
     } else {
@@ -3088,10 +3166,11 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                    (size_ok && n_tok >= 1 && n_k >= min_dim && n_feat >= min_dim) &&
                    (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 ||
                     ggml_get_type_traits(src0->type)->to_float != NULL) &&
-                   // repacked weights: only the layouts the NPU side can convert back (Q4_0, Q4_K; 8-row groups)
+                   // repacked weights: only the layouts the NPU side can convert back (Q4_0, Q4_K, Q2_K,
+                   // IQ4_NL, MXFP4; 8-row groups)
                    (!ggml_xdna_is_cpu_repack(src0) ||
                     (ggml_xdna_repack_enabled() && ggml_n_dims(src0) == 2 && n_feat % 8 == 0 &&
-                     ((src0->type == GGML_TYPE_Q4_0 && n_k % 32 == 0) || (src0->type == GGML_TYPE_Q4_K && n_k % 256 == 0))));
+                     ggml_xdna_repacked_type_supported(src0->type, n_k)));
 
             if (ok && !decode && ggml_xdna_is_weight(src0)) {
                 ggml_xdna_warm_enqueue(src0, n_tok);
@@ -3142,8 +3221,7 @@ static bool ggml_backend_xdna_device_supports_op(ggml_backend_dev_t dev, const s
                     ggml_get_type_traits(as->type)->to_float != NULL) &&
                    // repacked experts: the layouts the NPU side can convert back, plane by plane
                    (!ggml_xdna_is_cpu_repack(as) ||
-                    (ggml_xdna_repack_enabled() && n_feat % 8 == 0 &&
-                     ((as->type == GGML_TYPE_Q4_0 && n_k % 32 == 0) || (as->type == GGML_TYPE_Q4_K && n_k % 256 == 0))));
+                    (ggml_xdna_repack_enabled() && n_feat % 8 == 0 && ggml_xdna_repacked_type_supported(as->type, n_k)));
         }
 
         default:
