@@ -88,6 +88,7 @@ loaded kernel, and processes sharing them unload each other's kernels. Side proc
 | `GGML_XDNA_VK_IMPORT_ALIGN` | `4096` | Vulkan build: alignment of host-memory imports |
 | `GGML_XDNA_VK_CACHE_MB` | `8192` | Vulkan build: memory for the GPU worker's weight copies |
 | `GGML_XDNA_W8_EMULATE` | `0` | diagnostic: round bf16 weights through int8 with this group size |
+| `GGML_XDNA_A8_EMULATE` | `0` | diagnostic: round the NPU's activations through int8 with this group size (one scale per token row and group), to judge an int8 x int8 kernel |
 
 Recommended: leave everything at its default. For models of 20B and more, `GGML_XDNA_NPU_W8=1` with
 `GGML_XDNA_NPU_CACHE_MB=5120` covers as many weights as a 10 GB bf16 cache.

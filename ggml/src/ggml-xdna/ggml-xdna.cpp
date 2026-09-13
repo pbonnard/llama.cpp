@@ -1371,8 +1371,8 @@ static int64_t ggml_xdna_w8_group() {
     return group;
 }
 
-static void ggml_xdna_w8_emulate(ggml_backend_xdna_context * ctx, ggml_bf16_t * dst, int64_t n_rows, int64_t ne0, int64_t dst_stride) {
-    const int64_t group = ggml_xdna_w8_group();
+// round n_rows bf16 rows (stride dst_stride) through int8 in place, with one scale per row and group values
+static void ggml_xdna_int8_round_rows(ggml_backend_xdna_context * ctx, ggml_bf16_t * dst, int64_t n_rows, int64_t ne0, int64_t dst_stride, int64_t group) {
     if (group <= 0) {
         return;
     }
@@ -1397,6 +1397,25 @@ static void ggml_xdna_w8_emulate(ggml_backend_xdna_context * ctx, ggml_bf16_t * 
             }
         }
     });
+}
+
+static void ggml_xdna_w8_emulate(ggml_backend_xdna_context * ctx, ggml_bf16_t * dst, int64_t n_rows, int64_t ne0, int64_t dst_stride) {
+    ggml_xdna_int8_round_rows(ctx, dst, n_rows, ne0, dst_stride, ggml_xdna_w8_group());
+}
+
+// GGML_XDNA_A8_EMULATE=<group>: round the activations the NPU receives through int8, with one scale per
+// token row and <group> values, to measure the accuracy of an int8 x int8 kernel before building one
+// (0: off). Batched paths only (dense and mixture of experts).
+static int64_t ggml_xdna_a8_group() {
+    static const int64_t group = []() {
+        const char * env = ggml_xdna_getenv("GGML_XDNA_A8_EMULATE");
+        return env != nullptr ? std::max<int64_t>(0, std::atoll(env)) : (int64_t) 0;
+    }();
+    return group;
+}
+
+static void ggml_xdna_a8_emulate(ggml_backend_xdna_context * ctx, ggml_bf16_t * rows, int64_t n_rows, int64_t ne0, int64_t stride) {
+    ggml_xdna_int8_round_rows(ctx, rows, n_rows, ne0, stride, ggml_xdna_a8_group());
 }
 
 // weight rows of src0, plain or CPU_REPACK, to bf16
@@ -1839,6 +1858,7 @@ static void ggml_xdna_mul_mat_npu(ggml_backend_xdna_context * ctx, struct ggml_t
     for (int64_t i13 = 0; i13 < ne13; i13++) {
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             ggml_xdna_rows_to_bf16(ctx, src1, 0, n_tok, i12, i13, ctx->x_bf16.data(), n_k);
+            ggml_xdna_a8_emulate(ctx, ctx->x_bf16.data(), n_tok, n_k, n_k);
             char * d_plane = (char *) dst->data + i12*nb2 + i13*nb3 + feat0*nb0;
             ggml_xdna_npu_gemm(ctx, src0, i12/r2, i13/r3, feat0, feat1 - feat0, ctx->x_bf16.data(), n_tok,
                                [&](int64_t t) { return (float *) (d_plane + t*nb1); });
@@ -2902,6 +2922,7 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
                 const float * src = (const float *) ((const char *) b->data + (grp[j].first % b->ne[1])*b->nb[1] + grp[j].second*b->nb[2]);
                 ggml_fp32_to_bf16_row(src, ctx->x_bf16.data() + j*n_k, n_k);
             }
+            ggml_xdna_a8_emulate(ctx, ctx->x_bf16.data(), cnt, n_k, n_k);
             const ggml_tensor v = expert_view(id);
             ggml_xdna_npu_gemm(ctx, &v, 0, 0, f0, f1 - f0, ctx->x_bf16.data(), cnt, [&](int64_t j) {
                 return (float *) ((char *) dst->data + grp[j].first*dst->nb[1] + grp[j].second*dst->nb[2]) + f0;
