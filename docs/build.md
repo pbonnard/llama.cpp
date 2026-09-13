@@ -837,121 +837,46 @@ Check [README.md](./backend/snapdragon/README.md) for target specific build and 
 
 ## XDNA (AMD Ryzen AI NPU)
 
-The XDNA backend pairs the CPU backend with the NPU found in AMD Ryzen AI processors. It keeps
-all tensors in host memory and, through the normal scheduler splitting, takes over only the
-prompt-processing sized `MUL_MAT`s (batches of `GGML_XDNA_MIN_BATCH` tokens or more, default 32)
-for which it has a precompiled NPU kernel; token generation stays on the CPU. It has been brought
-up on XDNA1 (Phoenix / Hawk Point, e.g. Ryzen 7 8700G) — the generation the vendor LLM stacks skip.
+The XDNA backend runs matrix multiplications on the NPU of AMD Ryzen AI processors, together with
+the CPU and, in a Vulkan build, the integrated GPU. It keeps all tensors in host memory and takes
+prompt-processing matrix multiplications (`MUL_MAT` and `MUL_MAT_ID`, 32 tokens or more); token
+generation stays on the CPU. It targets XDNA1 (Phoenix / Hawk Point, e.g. Ryzen 7 8700G), the
+generation the vendor LLM stacks skip, and has been tested on Windows only.
 
 Requirements:
 
-- the AMD NPU driver (which ships the XRT runtime, `xrt_coreutil.dll` / `libxrt_coreutil.so`),
-- precompiled kernels in `ggml/src/ggml-xdna/kernels/` (see the README there; they are built once
-  with the open-source [mlir-aie / IRON](https://github.com/Xilinx/mlir-aie) toolchain).
+- the AMD NPU driver, which ships the XRT runtime (`xrt_coreutil.dll` / `libxrt_coreutil.so`),
+- the precompiled kernels in `ggml/src/ggml-xdna/kernels/` (built with the open-source
+  [mlir-aie / IRON](https://github.com/Xilinx/mlir-aie) toolchain; see the README there to rebuild them).
 
-Build:
+Build, from a Visual Studio developer shell on Windows:
 
 ```bash
-cmake -B build -DGGML_XDNA=ON
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_XDNA=ON                  # CPU + NPU
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_XDNA=ON -DGGML_VULKAN=ON # CPU + NPU + iGPU
 cmake --build build --config Release
 ```
 
-On Windows the import library for `xrt_coreutil.dll` is generated automatically from the driver
-DLL at configure time (`dumpbin`/`lib` from a Visual Studio developer shell); pass
-`-DGGML_XDNA_XRT_LIB=<xrt_coreutil.lib>` to use your own. On Linux XRT is looked up under
-`/opt/xilinx/xrt`. `GGML_XDNA_KERNEL_DIR` (CMake) / `$GGML_XDNA_KERNEL_DIR` (runtime) override the
-kernel location.
+On Windows the import library for `xrt_coreutil.dll` is generated from the driver DLL at configure
+time; pass `-DGGML_XDNA_XRT_LIB=<xrt_coreutil.lib>` to use your own. On Linux XRT is looked up under
+`/opt/xilinx/xrt`. `-DGGML_XDNA_KERNEL_DIR=<dir>` sets the kernel directory compiled in as the
+default, and `$GGML_XDNA_KERNEL_DIR` overrides it at run time.
 
-Usage notes:
+Running:
 
 - The backend is picked up automatically as an accelerator device (`XDNA` in `--list-devices`).
-- Weights the CPU backend repacks for its SIMD kernels (`CPU_REPACK` buffers) are split too when the
-  layout is supported (currently Q4_0 and Q4_K, x86 only): the NPU converts its rows back to bf16 once, and
-  the CPU worker keeps using the repacked kernels. Other repacked types stay on the CPU;
-  `--no-repack` (`-nr`) routes every quantized type through plain host buffers instead, and
-  `GGML_XDNA_REPACK=0` turns the repacked path off.
-- Each matmul the backend receives is split by output features between the NPU, a private Vulkan
-  backend on the integrated GPU (when llama.cpp is built with `GGML_VULKAN=ON` as well; the AMD
-  device is picked automatically, `GGML_XDNA_VK_DEVICE=<n>` overrides) and a private CPU backend,
-  all running at the same time. `GGML_XDNA_NPU_SHARE` / `GGML_XDNA_VK_SHARE` (`0..1`) set the NPU
-  and GPU shares, the CPU takes the rest (defaults 0 / 0.8 / 0.2 with Vulkan); `GGML_XDNA_NPU_SHARE=auto`
-  learns each worker's speed per matrix shape and gives the NPU the number of whole kernel blocks
-  (possibly none) that finishes the operation earliest; it is the default without Vulkan, and the
-  0.4 / 0.6 split only serves the first measurement. With a GPU
-  present the NPU only joins products of at least `GGML_XDNA_NPU_MIN_GFLOP` (default 4).
-  Measured on the 8700G (`-nr -ngl 0`, 476-token prompt, best of 2): Qwen3-0.6B Q4_0 — Vulkan
-  worker alone ~670 t/s, Vulkan 0.8 + CPU 0.2 ~715 t/s, CPU only ~390 t/s, every split that
-  includes the NPU 400–540 t/s; gemma-4-E2B Q4_K_M — Vulkan 0.8 + CPU 0.2 ~260 t/s, with the NPU
-  at 0.1 ~160 t/s. The 780M is roughly 10x the XDNA1 at batched GEMM, so next to it the NPU only
-  lengthens each op's critical path; that is why it is off by default when a GPU worker exists.
-  For comparison the whole model on the 780M through llama.cpp's own Vulkan backend
-  (`-ngl 99 -dev Vulkan1`) runs at 2000–3200 t/s (0.6B) / ~530 t/s (E2B): on a UMA APU keep the
-  model GPU-resident whenever it fits and use the XDNA backend for host-resident weights.
-- The Vulkan worker is zero-copy on a UMA GPU: activations and the destination rows are imported
-  in place (`VK_EXT_external_memory_host`) and the GPU writes its rows straight into the ggml
-  tensor; weight slices are copied once into device memory and kept (mmap'd model files cannot
-  be imported), up to `GGML_XDNA_VK_CACHE_MB` (default 8192). `GGML_XDNA_VK_ZERO_COPY=0` forces
-  the plain copy path. Reading back from the 780M's device-local memory is very slow on the
-  current AMD Windows driver (~50 MB/s), which is why the copy path and any GPU→host split
-  boundary cost so much more than the compute itself.
-  Measured on a Ryzen 7 8700G (CPU+NPU build, `-nr`, ~476-token prompt, 8 threads, median of 5):
-  Qwen3-0.6B Q4_0 — CPU only 398 t/s, NPU only 380, CPU+NPU 518 with the `auto` default (474 at 0.4);
-  gemma-4-E2B Q4_K_M — CPU only 125, NPU only 105, CPU+NPU 162 with `auto` (164 at 0.4). The stock repacked
-  CPU path is still faster (582 / 217 t/s); with repacked weights (no `-nr`) CPU+NPU beats it once
-  the NPU's bf16 weight cache is warm (`llama-bench -p 512 -r 5`: Qwen3-0.6B Q4_0 ~800 vs ~600 t/s,
-  gemma-4-E2B Q4_K_M ~270 vs ~218). llama-server's first request, after the load-time warm-up,
-  runs at 615–708 vs 544–592 t/s (Qwen3-0.6B) and 229–260 vs 202–224 (gemma-4-E2B); a prompt
-  that arrives during loading only ties the CPU, since it pays the remaining weight conversion. With the NPU's share at 0 the XDNA path costs
-  ~3% on Qwen3-0.6B (an extra graph split per matmul) and nothing measurable on gemma-4-E2B.
-  Decode is unchanged.
-- The scheduler-level combination also works: with `-ngl N` the first N layers live on the Vulkan
-  device and the remaining layers' prompt matmuls go through the XDNA backend (and its workers).
-- The NPU's blocks are pipelined (the host stages the next block while the NPU computes the current
-  one), and the bf16 copies of the model weights it handles are converted once and cached, up to
-  `GGML_XDNA_NPU_CACHE_MB` (default 4096; `0` converts on every call). Only tensors in model-weight
-  buffers are cached by either the NPU or the Vulkan worker. The NPU's cache is shared by all
-  XDNA backends and keeps the leading rows of each weight, extending them when a split gives the
-  NPU more rows.
-- Load-time warm-up: while llama.cpp reserves its compute graphs, the weights the NPU will handle
-  are queued, and a background thread loads their kernels and converts the rows the NPU is
-  expected to take (about half with the auto split, or the fixed `GGML_XDNA_NPU_SHARE`; nothing
-  when the NPU is off next to a Vulkan worker), so a server's first prompt does not pay for it (gemma-4-E2B: 216 weights, ~2 GB of bf16, 1.7 s;
-  Qwen3-0.6B: 193 weights, 411 MB, 1.2 s).
-  The first NPU operation stops the warm-up, and whatever it had not reached is converted on first
-  use as before. `GGML_XDNA_NPU_WARM=0` turns it off.
-- `GGML_XDNA_NPU_W8=1` switches the NPU to int8 weights (the `mm_w8_*` kernels, see the kernels
-  README): one scale per row and 1,024 weights, applied by the host as it accumulates each block,
-  so the cache holds twice as many weights and each block copies half the bytes. The NPU's
-  compute time is unchanged. Accuracy against the stock CPU (KL divergence, NPU taking all
-  rows): Qwen3-0.6B 0.0044 vs 0.0020 for bf16, gemma-4-E2B 0.0191 vs 0.0138 (the CPU's own
-  `--no-repack` path: 0.0020 / 0.0196). Speed with the auto split (`llama-bench -p 512`):
-  Qwen3-0.6B 831 vs 784 t/s, gemma-4-E2B 241 vs 246. Off by default. It matters for large
-  models, whose NPU rows only speed things up once they fit the cache: qwen3.8:27b Q4_K_M
-  (`llama-server -ngl 0`) prefills at ~17.4 t/s on the CPU alone, and at ~19.8 t/s (+14%) with
-  the NPU and either int8 weights in a 5 GB cache or bf16 weights in a 10 GB one; with the
-  default 4 GB bf16 cache the NPU adds nothing. On a machine without a page file, keep the
-  cache well below free RAM: the 10 GB runs left no free memory, the 5 GB int8 run 4 GB.
-- Mixture-of-experts layers (`MUL_MAT_ID`, e.g. Mixtral) are split the same way during prompt
-  processing when the NPU takes part (not next to a GPU worker with the NPU at 0). The NPU
-  computes the first rows of every expert: the tokens routed to each expert are gathered and
-  multiplied by that expert's rows as one NPU product. The CPU backend computes the other rows of
-  every expert as one `MUL_MAT_ID` over views, at the same time. The auto split models the NPU
-  from each expert's block count (its tokens are padded to the kernel's 64-256-token blocks) and
-  corrects the model by measurement. Expert weights are not warmed at load: they are most of an
-  MoE model's weights and rarely fit the cache. Mixtral 8x7B Q4_0 (`llama-bench -p 512 -r 3`):
-  18.0 vs 14.0 t/s on the CPU alone, KL divergence 0.0025 against the CPU (NPU on all rows:
-  0.0026). On Windows the weight cache also stops growing when less than 2 GB of commit would be
-  left, and an NPU worker that fails (e.g. out of memory) hands its rows to the CPU.
-- `GGML_XDNA_DEBUG=1` logs every `supports_op` decision; `GGML_XDNA_MIN_BATCH=<n>` raises the token
-  threshold (a very large value disables NPU use without rebuilding). `GGML_XDNA_DISABLE=1` removes
-  the device altogether without opening the NPU (useful for `--version` / `--list-devices` side
-  processes next to a server that owns the NPU).
-- The Vulkan worker writes its rows into a contiguous imported scratch buffer and copies them into
-  the destination, because the Vulkan backend's split-k matmul path requires a contiguous result.
-- The first-generation NPU is a low-power part: its dense bf16 GEMM throughput (~0.2 TFLOPS on 4
-  columns) is below what the 8 Zen 4 cores reach on quantized weights, so expect the CPU+NPU split
-  to trade some prompt-processing speed for offloaded work rather than to beat the CPU outright.
-  `test-backend-ops -b XDNA -o MUL_MAT` verifies the NPU path against the CPU reference.
+  Keep the layers on the CPU (`-ngl 0`); in a Vulkan build, `--device none` keeps the model off the
+  GPUs, and `-ngl 999` runs it entirely on a GPU, where the NPU plays no part.
+- The defaults (the `auto` split between NPU, CPU and GPU worker, bf16 weights cached for the NPU,
+  load-time warm-up) are the recommended settings.
+- Run one XDNA process at a time: the XDNA1 driver grants 5 NPU hardware contexts in total, one per
+  loaded kernel. Side processes such as `--version` next to a running server should set
+  `GGML_XDNA_DISABLE=1`, which hides the device without opening the NPU.
+- `test-backend-ops -b XDNA -o MUL_MAT` checks the NPU path against the CPU reference.
+
+Every `GGML_XDNA_*` setting, how the backend works, and measured performance are in
+[docs/backend/XDNA.md](backend/XDNA.md); the kernels are described in
+[ggml/src/ggml-xdna/kernels/README.md](../ggml/src/ggml-xdna/kernels/README.md).
 
 ---
 ## Notes about GPU-accelerated backends
