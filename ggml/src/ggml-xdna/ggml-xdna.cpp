@@ -2475,8 +2475,11 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     // the NPU part is rounded to whole blocks of the kernel it will run on - a partial block
     // costs the NPU as much as a full one - so a small share can round down to nothing on a
     // small op; an op too small to amortize the launch cost skips the NPU when others exist
+    // the GPU-worker gate (GGML_XDNA_NPU_MIN_GFLOP) only applies to ops the GPU worker takes part in:
+    // it cannot read the CPU's repacked weights, and without it the NPU is what speeds the CPU up
     const double gflop = 2.0*n_feat*ne00*ne11/1e9;
-    const bool npu_worthwhile = gflop >= ctx->npu_min_gflop || (ctx->vk == nullptr && ctx->cpu == nullptr);
+    const bool vk_takes_part  = ctx->vk != nullptr && ctx->share[GGML_XDNA_WORKER_VK] > 0.0f && !ggml_xdna_is_cpu_repack(src0);
+    const bool npu_worthwhile = !vk_takes_part || gflop >= ctx->npu_min_gflop;
 
     const float share_used[GGML_XDNA_N_WORKERS] = {
         ctx->share[GGML_XDNA_WORKER_NPU], ctx->share[GGML_XDNA_WORKER_VK], ctx->share[GGML_XDNA_WORKER_CPU] };
