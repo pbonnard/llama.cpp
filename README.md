@@ -18,24 +18,101 @@ For everything else about llama.cpp — installation, models, tools, the server,
   all running at the same time.
 - **Measure on real hardware** and keep as defaults only what actually helps.
 
-## How it works
+## Architecture
 
-- Prompt-processing matrix multiplies (`MUL_MAT`, and `MUL_MAT_ID` for mixture-of-experts layers, with 32 or more
-  tokens) go to the backend. Token generation stays on the CPU unless the experimental `GGML_XDNA_NPU_DECODE` is set.
-- The NPU runs precompiled block matrix-multiply kernels (bf16, or int8 weights with bf16 activations, f32 results),
-  built with the open-source [IRON / mlir-aie](https://github.com/Xilinx/mlir-aie) toolchain and launched through
-  XRT, which ships with the AMD NPU driver. A launch costs ~180 µs of dispatch whatever its size, so the kernels take
-  a whole 512-token batch at once, in blocks of 512 or 256 weight rows and 1,024 to 2,048 inputs. The host prepares
-  the next block while the NPU computes the current one.
-- Model weights are converted to bf16 (or int8) once and cached. Every ggml weight type works, including the layouts
-  the CPU backend re-arranges for its SIMD kernels (repacked Q4_0, Q4_K, Q2_K, IQ4_NL and MXFP4), which the backend
-  converts back exactly.
-- Each matrix multiply the backend receives is split by output rows between the NPU, a CPU backend and, when built
-  with Vulkan, a Vulkan backend on the integrated GPU. On the APU's shared memory the Vulkan worker reads the
-  activations and writes its results in place, and keeps a copy of each weight on the GPU.
-- By default (`auto`) the backend learns how fast each worker is for every matrix shape, and gives the NPU the number
-  of rows — in whole kernel blocks, possibly none — that makes the operation finish earliest. It predicts the NPU
-  from each kernel's measured launch time, corrected per shape by measurement.
+The two builds come from the same source; the only difference is whether a GPU takes part.
+
+| | CPU + NPU build | CPU + NPU + iGPU build |
+|---|---|---|
+| CMake | `-DGGML_XDNA=ON` | `-DGGML_XDNA=ON -DGGML_VULKAN=ON` |
+| llama.cpp backends | CPU, XDNA | CPU, XDNA, Vulkan (each GPU) |
+| workers inside the XDNA backend | NPU + CPU | NPU + CPU + Vulkan (the integrated Radeon) |
+
+### What the XDNA backend receives
+
+```
+ model graph (one batch)
+ ┌────────┐   ┌──────────┐   ┌────────┐   ┌──────────┐   ┌────────┐
+ │  CPU   │ → │  XDNA    │ → │  CPU   │ → │  XDNA    │ → │  CPU   │ …
+ │ norm,  │   │ MUL_MAT  │   │ rope,  │   │ MUL_MAT  │   │ softmax│
+ │ add …  │   │ (q,k,v…) │   │ attn … │   │ (ffn …)  │   │ …      │
+ └────────┘   └──────────┘   └────────┘   └──────────┘   └────────┘
+```
+
+- The XDNA backend is an accelerator device that works on host memory, the same memory as the CPU backend, so
+  handing it an operation needs no tensor copies.
+- llama.cpp's scheduler asks it about every node, and it claims only prompt-processing matrix multiplies: `MUL_MAT`
+  with 32 or more tokens on weights it can convert, and `MUL_MAT_ID` for mixture-of-experts layers. Everything else
+  stays on the CPU backend. The graph is split at every hand-off, which costs up to ~3% on very small models.
+- Token generation (one token per step) stays on the CPU, unless the experimental `GGML_XDNA_NPU_DECODE` is set.
+- In the Vulkan build with `-ngl N`, the layers placed on a GPU run entirely on llama.cpp's own Vulkan backend; the
+  XDNA backend only sees matrix multiplies whose weights stay in host memory.
+
+### How each matrix multiply is split
+
+```
+ weight rows (output features) of one MUL_MAT
+ ┌──────────────┬──────────────────────┬─────────────────┐
+ │  NPU rows    │  Vulkan-worker rows  │  CPU rows       │
+ │  [0, c)      │  (Vulkan build only) │  (the rest)     │
+ └──────┬───────┴──────────┬───────────┴────────┬────────┘
+        │ thread           │ thread             │ calling thread
+        ▼                  ▼                    ▼
+   XRT → NPU          private ggml          private ggml
+   (IRON kernels)     Vulkan backend        CPU backend
+                      on the iGPU           (OpenMP threads)
+        └──────── each writes its own rows of the same result ────────┘
+```
+
+- The three workers compute at the same time and write straight into their own rows of the result, so nothing has
+  to be merged.
+- The auto split (the default) learns, for every matrix shape, how fast the CPU and Vulkan workers are, and predicts
+  the NPU from each kernel's measured launch time, corrected per shape by measurement. It gives the NPU whole
+  256-row steps (possibly none) so that the operation finishes earliest, and shares the rest between the Vulkan and
+  CPU workers in proportion to their speed. A shape the NPU dropped out of gets one block every 16th operation, so a
+  single bad measurement can't keep the NPU off it for good.
+- Next to the Vulkan worker the NPU only joins operations of at least 4 GFLOP (the Radeon 780M is roughly 10× faster
+  than the NPU at matrix multiply), and only on operations the Vulkan worker takes part in.
+- The CPU backend re-arranges Q4_0, Q4_K, Q2_K, IQ4_NL and MXFP4 weights for its SIMD kernels. The Vulkan worker
+  cannot read that layout, so operations on those weights are split between the CPU and the NPU only; this is where
+  the NPU contributes most.
+
+### The NPU worker
+
+- It drives the NPU through XRT, which ships with the AMD NPU driver, and runs precompiled block matrix-multiply
+  kernels built with the open-source [IRON / mlir-aie](https://github.com/Xilinx/mlir-aie) toolchain: bf16 × bf16 →
+  f32, or int8 weights × bf16 activations. Each kernel computes one fixed block, e.g. 512 weight rows × 1,024 inputs
+  × 512 tokens. A launch costs ~180 µs of dispatch whatever its size, so the blocks are large.
+- Its weights are converted once to bf16 (or int8 with `GGML_XDNA_NPU_W8=1`) and cached (`GGML_XDNA_NPU_CACHE_MB`,
+  default 4 GB). Every ggml weight type works, including the CPU's repacked layouts, which are converted back exactly.
+  A background thread starts the conversion while the model loads.
+- Activations are converted to bf16 on every call. While the NPU computes one block, the host fills the other of two
+  buffer slots with the next block's weights and activations; it then adds up the partial sums across input blocks,
+  applies the int8 scales, and writes the result rows.
+- The XDNA1 driver allows at most 5 loaded kernels (hardware contexts), so the backend unloads the least recently
+  used one when it needs another. A model uses 2–5.
+- Mixture of experts: the tokens routed to each expert are gathered, the NPU computes the first rows of every
+  active expert, and the CPU computes the other rows of all experts in one operation.
+
+### The CPU and Vulkan workers
+
+- The CPU worker is a private instance of ggml's CPU backend. It runs a one-operation graph over a view of its rows
+  of the weights, keeping their repacked layout, so its share runs at full SIMD speed.
+- The Vulkan worker (Vulkan build only) is a private instance of ggml's Vulkan backend on the integrated Radeon (the
+  first AMD device). On the APU's shared memory it maps the activations and its result rows into the GPU in place,
+  and copies each weight to the GPU once, whole; it then reads a view of whichever rows the split gives it.
+
+### Which configuration uses what
+
+| build and options | what computes the matrix multiplies |
+|---|---|
+| CPU + NPU build, `-ngl 0` | CPU + NPU split each prompt matrix multiply |
+| Vulkan build, `-ngl 0 --device none` | CPU + NPU + iGPU worker split each one; repacked weights go to CPU + NPU |
+| Vulkan build, `-ngl 999` | the whole model on a GPU through llama.cpp's Vulkan backend; the NPU is idle (fastest when the model fits) |
+| Vulkan build, `-ngl N` | GPU layers on Vulkan; the other layers' prompt matrix multiplies through the XDNA split |
+
+On a Ryzen 7 8700G the NPU makes prompt processing 1.1–1.7× faster than the CPU alone (see the results below); token
+generation is unchanged and always runs on the CPU or a GPU.
 
 ## Results
 
