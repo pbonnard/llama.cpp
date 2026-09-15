@@ -92,7 +92,9 @@ The two builds come from the same source; the only difference is whether a GPU t
 - The XDNA1 driver allows at most 5 loaded kernels (hardware contexts), so the backend unloads the least recently
   used one when it needs another. A model uses 2–5.
 - Mixture of experts: the tokens routed to each expert are gathered, the NPU computes the first rows of every
-  active expert, and the CPU computes the other rows of all experts in one operation.
+  active expert, and the CPU computes the other rows of all experts in one operation. In the Vulkan build the
+  first tokens of each operation go whole to the Vulkan worker, which keeps a copy of each expert tensor on the
+  GPU (within `GGML_XDNA_VK_CACHE_MB`, default 8 GB); the auto split sets how many from the measured speeds.
 
 ### The CPU and Vulkan workers
 

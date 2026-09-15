@@ -642,6 +642,7 @@ struct ggml_backend_xdna_context {
         bool   npu_seen  = false;             // the NPU has run this shape (its first run is not learned)
         int    npu_skips = 0;                 // ops planned without the NPU since it was measured
         double npu_corr  = 0.0;               // measured / modelled NPU time (0 until known)
+        bool   vk_bad    = false;             // the Vulkan worker failed on this MUL_MAT_ID shape
     };
     std::map<std::tuple<int64_t, int64_t, int>, shape_perf> shape_perf_map;
     double mac_thr[3] = { 0.0, 0.0, 0.0 };   // NPU, VK, CPU
@@ -775,31 +776,42 @@ static bool ggml_xdna_mul_mat_vk_copy(ggml_backend_xdna_context * ctx, struct gg
 }
 
 // import the host range [ptr, ptr + size) into the Vulkan device (page-rounded) and return the
-// buffer plus the address the tensor must be placed at; nullptr if the device cannot import
+// buffer plus the address the tensor must be placed at; nullptr if the device cannot import.
+// The caller frees the buffer before the memory is freed.
+static ggml_backend_buffer_t ggml_xdna_vk_import_uncached(ggml_backend_xdna_context * ctx, const void * ptr, size_t size, void ** tensor_addr) {
+    const uintptr_t align = ctx->vk_import_align;
+    const uintptr_t base  = (uintptr_t) ptr & ~(align - 1);
+    const uintptr_t end   = ((uintptr_t) ptr + size + align - 1) & ~(align - 1);
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(ctx->vk);
+    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (void *) base, end - base, end - base);
+    if (buf != nullptr) {
+        *tensor_addr = (char *) ggml_backend_buffer_get_base(buf) + ((uintptr_t) ptr - base);
+    }
+    return buf;
+}
+
+// as above, cached by page-aligned range
 static ggml_backend_buffer_t ggml_xdna_vk_import(ggml_backend_xdna_context * ctx, const void * ptr, size_t size, void ** tensor_addr) {
     const uintptr_t align = ctx->vk_import_align;
     const uintptr_t base  = (uintptr_t) ptr & ~(align - 1);
     const uintptr_t end   = ((uintptr_t) ptr + size + align - 1) & ~(align - 1);
 
-    ggml_backend_buffer_t buf = nullptr;
     auto it = ctx->vk_imports.find({base, end});
     if (it != ctx->vk_imports.end()) {
-        buf = it->second;
-    } else {
-        if (ctx->vk_imports.size() >= 4096) {
-            for (auto & kv : ctx->vk_imports) {
-                ggml_backend_buffer_free(kv.second);
-            }
-            ctx->vk_imports.clear();
+        *tensor_addr = (char *) ggml_backend_buffer_get_base(it->second) + ((uintptr_t) ptr - base);
+        return it->second;
+    }
+    if (ctx->vk_imports.size() >= 4096) {
+        for (auto & kv : ctx->vk_imports) {
+            ggml_backend_buffer_free(kv.second);
         }
-        ggml_backend_dev_t dev = ggml_backend_get_device(ctx->vk);
-        buf = ggml_backend_dev_buffer_from_host_ptr(dev, (void *) base, end - base, end - base);
-        if (buf == nullptr) {
-            return nullptr;
-        }
+        ctx->vk_imports.clear();
+    }
+    ggml_backend_buffer_t buf = ggml_xdna_vk_import_uncached(ctx, ptr, size, tensor_addr);
+    if (buf != nullptr) {
         ctx->vk_imports[{base, end}] = buf;
     }
-    *tensor_addr = (char *) ggml_backend_buffer_get_base(buf) + ((uintptr_t) ptr - base);
     return buf;
 }
 
@@ -883,6 +895,47 @@ static ggml_tensor * ggml_xdna_vk_weight_slice(ggml_backend_xdna_context * ctx, 
     cached = false;
     row0   = feat0;
     return temp.a;
+}
+
+// device-resident copy of a whole expert tensor [K, M, n_expert] for the Vulkan worker, cached like the
+// dense weights; nullptr beyond the budget, since a copy of all experts per op costs more than it saves
+static ggml_tensor * ggml_xdna_vk_experts(ggml_backend_xdna_context * ctx, const ggml_tensor * as) {
+    const size_t   bytes = ggml_nbytes(as);
+    const uint64_t sig   = ggml_xdna_weight_sig(as->data, bytes, as->type, as->ne[0]);
+    const auto     key   = std::make_tuple((const void *) as->data, (int64_t) -1, as->ne[2]);
+    auto it = ctx->vk_weights.find(key);
+    if (it != ctx->vk_weights.end()) {
+        if (it->second.sig == sig) {
+            return it->second.a;
+        }
+        ggml_backend_buffer_free(it->second.buf);
+        ggml_free(it->second.wctx);
+        ctx->vk_weight_bytes -= it->second.bytes;
+        ctx->vk_weights.erase(it);
+    }
+    if (ctx->vk_weight_bytes + bytes > ctx->vk_weight_limit) {
+        return nullptr;
+    }
+
+    struct ggml_init_params ip = {
+        /* .mem_size   = */ ggml_tensor_overhead(),
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ true,
+    };
+    ggml_backend_xdna_context::vk_weight w;
+    w.wctx  = ggml_init(ip);
+    w.a     = ggml_new_tensor_3d(w.wctx, as->type, as->ne[0], as->ne[1], as->ne[2]);
+    w.buf   = ggml_backend_alloc_ctx_tensors(w.wctx, ctx->vk);
+    w.sig   = sig;
+    w.bytes = bytes;
+    if (w.buf == nullptr) {
+        ggml_free(w.wctx);
+        return nullptr;
+    }
+    ggml_backend_tensor_set(w.a, as->data, 0, bytes);
+    ctx->vk_weights[key] = w;
+    ctx->vk_weight_bytes += bytes;
+    return w.a;
 }
 
 // page-aligned host scratch for the Vulkan worker's result, grown on demand; the old block's
@@ -2738,9 +2791,11 @@ static void ggml_backend_xdna_mul_mat(ggml_backend_xdna_context * ctx, struct gg
     }
 }
 
-// rows [feat0, feat1) of every expert of a MUL_MAT_ID on the CPU backend: one mul_mat_id over views of
-// the experts' row slices (a slice starting on an 8-row group is itself a valid repacked tensor)
-static bool ggml_xdna_mul_mat_id_cpu(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst, int64_t feat0, int64_t feat1) {
+// rows [feat0, feat1) of every expert of a MUL_MAT_ID, for tokens [tok0, tok1), on the CPU backend: one
+// mul_mat_id over views of the experts' row slices (a slice starting on an 8-row group is itself a valid
+// repacked tensor)
+static bool ggml_xdna_mul_mat_id_cpu(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst, int64_t feat0, int64_t feat1,
+                                     int64_t tok0, int64_t tok1) {
     ggml_backend_t cpu = ggml_xdna_cpu_backend(ctx);
     if (cpu == nullptr) {
         return false;
@@ -2765,16 +2820,16 @@ static bool ggml_xdna_mul_mat_id_cpu(ggml_backend_xdna_context * ctx, struct ggm
         a->extra  = as->extra;
     }
 
-    ggml_tensor * bb = ggml_new_tensor_3d(gctx, b->type, b->ne[0], b->ne[1], b->ne[2]);
-    bb->data = b->data;
+    ggml_tensor * bb = ggml_new_tensor_3d(gctx, b->type, b->ne[0], b->ne[1], tok1 - tok0);
+    bb->data = (char *) b->data + tok0*b->nb[2];
     std::memcpy(bb->nb, b->nb, sizeof(bb->nb));
 
-    ggml_tensor * ii = ggml_new_tensor_2d(gctx, ids->type, ids->ne[0], ids->ne[1]);
-    ii->data = ids->data;
+    ggml_tensor * ii = ggml_new_tensor_2d(gctx, ids->type, ids->ne[0], tok1 - tok0);
+    ii->data = (char *) ids->data + tok0*ids->nb[1];
     std::memcpy(ii->nb, ids->nb, sizeof(ii->nb));
 
     ggml_tensor * c = ggml_mul_mat_id(gctx, a, bb, ii);
-    c->data  = (char *) dst->data + feat0*dst->nb[0];
+    c->data  = (char *) dst->data + feat0*dst->nb[0] + tok0*dst->nb[2];
     c->nb[1] = dst->nb[1];
     c->nb[2] = dst->nb[2];
     c->nb[3] = dst->nb[3];
@@ -2787,11 +2842,62 @@ static bool ggml_xdna_mul_mat_id_cpu(ggml_backend_xdna_context * ctx, struct ggm
     return status == GGML_STATUS_SUCCESS;
 }
 
+// tokens [0, tok1) of a MUL_MAT_ID on the Vulkan worker, all rows: the experts come from a cached device
+// copy, the activations, ids and result are imported in place (b and dst are contiguous). These imports
+// live for this op only: the scheduler may free and reuse the memory, and an import keeps the old pages.
+static bool ggml_xdna_mul_mat_id_vk(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst, ggml_tensor * experts, int64_t tok1) {
+    ggml_backend_t vk = ggml_xdna_vk_backend(ctx);
+    if (vk == nullptr) {
+        return false;
+    }
+
+    const struct ggml_tensor * b   = dst->src[1];
+    const struct ggml_tensor * ids = dst->src[2];
+
+    struct ggml_init_params ip = {
+        /* .mem_size   = */ ggml_tensor_overhead()*8 + ggml_graph_overhead(),
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context * gctx = ggml_init(ip);
+
+    ggml_tensor * bb = ggml_new_tensor_3d(gctx, b->type, b->ne[0], b->ne[1], tok1);
+    ggml_tensor * ii = ggml_new_tensor_2d(gctx, ids->type, ids->ne[0], tok1);
+    ii->nb[1] = ids->nb[1];   // ids may be a view of the router's top-k
+    ii->nb[2] = ii->nb[3] = ids->nb[1]*tok1;
+    ggml_tensor * c = ggml_mul_mat_id(gctx, experts, bb, ii);
+
+    void * addr_b = nullptr;
+    void * addr_i = nullptr;
+    void * addr_c = nullptr;
+    ggml_backend_buffer_t buf_b = ggml_xdna_vk_import_uncached(ctx, b->data,   ggml_nbytes(bb),  &addr_b);
+    ggml_backend_buffer_t buf_i = ggml_xdna_vk_import_uncached(ctx, ids->data, ii->nb[2],        &addr_i);
+    ggml_backend_buffer_t buf_c = ggml_xdna_vk_import_uncached(ctx, dst->data, ggml_nbytes(c),   &addr_c);
+
+    bool ok = buf_b && buf_i && buf_c && ggml_backend_supports_op(vk, c) &&
+              ggml_backend_tensor_alloc(buf_b, bb, addr_b) == GGML_STATUS_SUCCESS &&
+              ggml_backend_tensor_alloc(buf_i, ii, addr_i) == GGML_STATUS_SUCCESS &&
+              ggml_backend_tensor_alloc(buf_c, c,  addr_c) == GGML_STATUS_SUCCESS;
+    if (ok) {
+        ggml_cgraph * graph = ggml_new_graph(gctx);
+        ggml_build_forward_expand(graph, c);
+        ok = ggml_backend_graph_compute(vk, graph) == GGML_STATUS_SUCCESS;
+    }
+    ggml_free(gctx);
+    for (ggml_backend_buffer_t buf : { buf_b, buf_i, buf_c }) {
+        if (buf != nullptr) {
+            ggml_backend_buffer_free(buf);
+        }
+    }
+    return ok;
+}
+
 // mixture-of-experts matmul (MUL_MAT_ID, prompt processing): rows [0, n_npu) of every expert on the
 // NPU - the (slot, token) pairs grouped by expert, one NPU product per expert - and the other rows on
-// the CPU as one MUL_MAT_ID over views, both at the same time. The auto split models the NPU from
-// each expert's block count and the measured block time (corrected by measurement per shape), and
-// the CPU from its measured speed.
+// the CPU as one MUL_MAT_ID over views, both at the same time. With a Vulkan worker, the first tokens
+// go whole to the GPU and the NPU and CPU split the rest, the token count set by the measured speeds.
+// The auto split models the NPU from each expert's block count and the measured block time (corrected
+// by measurement per shape), and the CPU from its measured speed.
 static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst) {
     const struct ggml_tensor * as  = dst->src[0];   // [K, M, n_expert]
     const struct ggml_tensor * b   = dst->src[1];   // [K, 1 or n_used, n_tok]
@@ -2807,13 +2913,43 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
     ggml_xdna_init_shares(ctx);
     ggml_xdna_state & st = ggml_xdna_get_state();
 
+    auto & sp = ctx->shape_perf_map[std::make_tuple(n_feat, n_k, (int) as->type + (ggml_xdna_is_cpu_repack(as) ? 1000 : 0) + 2000)];
+    // the CPU in rows*pairs per ms, measured on this shape or estimated from its average MAC rate
+    const double cpu_rate = sp.thr[GGML_XDNA_WORKER_CPU] > 0.0 ? sp.thr[GGML_XDNA_WORKER_CPU] :
+                            ctx->mac_thr[GGML_XDNA_WORKER_CPU] > 0.0 ? ctx->mac_thr[GGML_XDNA_WORKER_CPU]/n_k : 0.0;
+
+    // tokens [0, n_tok_vk) go whole to the Vulkan worker; the NPU and the CPU split the rows of the rest.
+    // The GPU cannot read repacked experts.
+    int64_t       n_tok_vk   = 0;
+    ggml_tensor * vk_experts = nullptr;
+    if (ctx->vk != nullptr && ctx->vk_zero_copy && ctx->share[GGML_XDNA_WORKER_VK] > 0.0f && !sp.vk_bad &&
+        ggml_xdna_is_weight(as) && !ggml_xdna_is_cpu_repack(as) && ggml_is_contiguous(b) && ggml_is_contiguous(dst)) {
+        vk_experts = ggml_xdna_vk_experts(ctx, as);
+    }
+    if (vk_experts != nullptr) {
+        const double vk_rate = sp.thr[GGML_XDNA_WORKER_VK] > 0.0 ? sp.thr[GGML_XDNA_WORKER_VK] :
+                               ctx->mac_thr[GGML_XDNA_WORKER_VK] > 0.0 ? ctx->mac_thr[GGML_XDNA_WORKER_VK]/n_k : 0.0;
+        double frac = ctx->share[GGML_XDNA_WORKER_VK];   // a fixed split, or the first measurements
+        if (!ctx->share_fixed && vk_rate > 0.0 && cpu_rate > 0.0) {
+            frac = vk_rate/(vk_rate + cpu_rate);
+        }
+        n_tok_vk = std::min(n_tok, (int64_t) (n_tok*frac + 0.5));
+        if (n_tok - n_tok_vk < 16) {
+            n_tok_vk = n_tok;   // not worth an NPU/CPU pass
+        }
+        if (n_tok_vk < 16) {
+            n_tok_vk = 0;
+        }
+    }
+    const int64_t n_pair_rest = n_used*(n_tok - n_tok_vk);
+
     // (slot, token) pairs by expert
     auto & groups = ctx->moe_groups;
     groups.resize(n_exp);
     for (auto & g : groups) {
         g.clear();
     }
-    for (int64_t t = 0; t < n_tok; t++) {
+    for (int64_t t = n_tok_vk; t < n_tok; t++) {
         for (int64_t e = 0; e < n_used; e++) {
             const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + e*ids->nb[0]);
             GGML_ASSERT(id >= 0 && id < n_exp);
@@ -2853,7 +2989,6 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
     };
 
     // NPU rows: a fixed share, or the auto split's choice among multiples of the smallest kernel block
-    auto & sp = ctx->shape_perf_map[std::make_tuple(n_feat, n_k, (int) as->type + (ggml_xdna_is_cpu_repack(as) ? 1000 : 0) + 2000)];
     const int64_t step   = 256;
     int64_t       n_npu  = 0;
     double        t_pred = 0.0;
@@ -2861,28 +2996,27 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
     auto from_share = [&](float s) {
         return s >= 1.0f ? n_feat : std::min(n_feat, (int64_t) (n_feat*s + step/2)/step*step);
     };
-    if (ctx->cpu == nullptr) {
+    if (n_pair_rest == 0) {
+        n_npu = 0;   // all tokens on the Vulkan worker
+    } else if (ctx->cpu == nullptr) {
         n_npu = n_feat;
     } else if (ctx->share_fixed) {
         n_npu = from_share(ctx->share[GGML_XDNA_WORKER_NPU]);
     } else {
-        // the CPU in rows*pairs per ms, measured on this shape or estimated from its average MAC rate
-        const double cpu_rate = sp.thr[GGML_XDNA_WORKER_CPU] > 0.0 ? sp.thr[GGML_XDNA_WORKER_CPU] :
-                                ctx->mac_thr[GGML_XDNA_WORKER_CPU] > 0.0 ? ctx->mac_thr[GGML_XDNA_WORKER_CPU]/n_k : 0.0;
         if (cpu_rate <= 0.0) {
             n_npu = from_share(0.4f);   // measure both once
             mode  = "explore";
         } else {
             mode = "auto";
             const double corr = sp.npu_corr > 0.0 ? sp.npu_corr : 1.0;
-            double best_t = (double) n_feat*n_pair/cpu_rate;
+            double best_t = (double) n_feat*n_pair_rest/cpu_rate;
             for (int64_t c = step; ; c += step) {
                 c = std::min(c, n_feat);
                 const double tn = npu_model_ms(c);
                 if (tn < 0.0) {
                     break;
                 }
-                const double tt = std::max(tn*corr, (double) (n_feat - c)*n_pair/cpu_rate);
+                const double tt = std::max(tn*corr, (double) (n_feat - c)*n_pair_rest/cpu_rate);
                 if (tt < best_t) {
                     best_t = tt;
                     n_npu  = c;
@@ -2904,7 +3038,7 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
 
     const auto t_start = std::chrono::steady_clock::now();
     auto elapsed = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(); };
-    double t_npu = 0.0, t_cpu = 0.0;
+    double t_npu = 0.0, t_vk = 0.0, t_cpu = 0.0;
 
     // rows [f0, f1) of every expert on the NPU
     auto run_npu = [&](int64_t f0, int64_t f1) {
@@ -2931,8 +3065,14 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
     };
 
     ctx->npu_cold = false;
-    std::thread npu_thread;
-    bool npu_ok = true;
+    std::thread npu_thread, vk_thread;
+    bool npu_ok = true, vk_ok = true;
+    if (n_tok_vk > 0) {
+        vk_thread = std::thread([&]() {
+            vk_ok = ggml_xdna_mul_mat_id_vk(ctx, dst, vk_experts, n_tok_vk);
+            t_vk  = elapsed();
+        });
+    }
     if (n_npu > 0) {
         npu_thread = std::thread([&]() {
             // an exception must not escape the thread (it would abort the process): e.g. out of
@@ -2947,26 +3087,40 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
         });
     }
     bool cpu_ok = true;
-    if (n_npu < n_feat) {
-        cpu_ok = ggml_xdna_mul_mat_id_cpu(ctx, dst, n_npu, n_feat);
+    if (n_pair_rest > 0 && n_npu < n_feat) {
+        cpu_ok = ggml_xdna_mul_mat_id_cpu(ctx, dst, n_npu, n_feat, n_tok_vk, n_tok);
         t_cpu  = elapsed();
     }
     if (npu_thread.joinable()) {
         npu_thread.join();
     }
-    if (!npu_ok && !ggml_xdna_mul_mat_id_cpu(ctx, dst, 0, n_npu)) {
+    if (vk_thread.joinable()) {
+        vk_thread.join();
+    }
+    if (!npu_ok && !ggml_xdna_mul_mat_id_cpu(ctx, dst, 0, n_npu, n_tok_vk, n_tok)) {
         GGML_ABORT("%s: both the NPU and the CPU worker failed", __func__);
     }
     if (!cpu_ok) {
         run_npu(n_npu, n_feat);   // no CPU worker: the NPU finishes the rows
     }
+    if (!vk_ok) {
+        GGML_LOG_WARN("%s: Vulkan worker failed on this shape, computing its tokens on the CPU\n", __func__);
+        sp.vk_bad = true;
+        if (!ggml_xdna_mul_mat_id_cpu(ctx, dst, 0, n_feat, 0, n_tok_vk)) {
+            GGML_ABORT("%s: both the Vulkan and the CPU worker failed", __func__);
+        }
+    }
 
-    if (!ctx->share_fixed && npu_ok && cpu_ok) {
-        // learn the CPU's speed on this shape and the NPU model's correction (not from a shape's first
-        // NPU run, nor from one that loaded a kernel or converted weights)
-        if (n_npu < n_feat && t_cpu > 0.0) {
-            const double thr = (double) (n_feat - n_npu)*n_pair/(t_cpu*1e3);
+    if (!ctx->share_fixed && npu_ok && vk_ok && cpu_ok) {
+        // learn the CPU's and the Vulkan worker's speed on this shape and the NPU model's correction (not
+        // from a shape's first NPU run, nor from one that loaded a kernel or converted weights)
+        if (n_pair_rest > 0 && n_npu < n_feat && t_cpu > 0.0) {
+            const double thr = (double) (n_feat - n_npu)*n_pair_rest/(t_cpu*1e3);
             sp.thr[GGML_XDNA_WORKER_CPU] = sp.thr[GGML_XDNA_WORKER_CPU] > 0.0 ? 0.7*sp.thr[GGML_XDNA_WORKER_CPU] + 0.3*thr : thr;
+        }
+        if (n_tok_vk > 0 && t_vk > 0.0) {
+            const double thr = (double) n_feat*n_used*n_tok_vk/(t_vk*1e3);
+            sp.thr[GGML_XDNA_WORKER_VK] = sp.thr[GGML_XDNA_WORKER_VK] > 0.0 ? 0.7*sp.thr[GGML_XDNA_WORKER_VK] + 0.3*thr : thr;
         }
         if (n_npu > 0 && t_npu > 0.0 && sp.npu_seen && !ctx->npu_cold) {
             const double model = npu_model_ms(n_npu);
@@ -2983,9 +3137,9 @@ static void ggml_backend_xdna_mul_mat_id(ggml_backend_xdna_context * ctx, struct
     if (ggml_xdna_debug()) {
         static int op_id = 0;
         GGML_LOG_INFO("xdna_moe: op=%d feat=%" PRId64 " k=%" PRId64 " experts=%" PRId64 "/%" PRId64 " pairs=%" PRId64
-                      " rows=%" PRId64 "/%" PRId64 " t_ms=%.3f/%.3f mode=%s pred_ms=%.3f corr=%.2f cold=%d\n",
-                      op_id++, n_feat, n_k, n_active, n_exp, n_pair, n_npu, n_feat - n_npu,
-                      t_npu*1e3, t_cpu*1e3, mode, t_pred, sp.npu_corr, (int) ctx->npu_cold);
+                      " rows=%" PRId64 "/%" PRId64 " vk_tok=%" PRId64 " t_ms=%.3f/%.3f/%.3f mode=%s pred_ms=%.3f corr=%.2f cold=%d\n",
+                      op_id++, n_feat, n_k, n_active, n_exp, n_pair, n_npu, n_feat - n_npu, n_tok_vk,
+                      t_npu*1e3, t_vk*1e3, t_cpu*1e3, mode, t_pred, sp.npu_corr, (int) ctx->npu_cold);
     }
 }
 
