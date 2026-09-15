@@ -612,8 +612,9 @@ struct ggml_backend_xdna_context {
     double npu_min_gflop = 0.0;               // ops below this skip the NPU (set when a GPU exists)
 
     // Vulkan zero-copy: on a UMA GPU the worker imports the host ranges of the operands as
-    // device buffers (VK_EXT_external_memory_host) instead of copying them. Imports are cached
-    // by page-aligned range since weights and scheduler buffers keep their addresses.
+    // device buffers (VK_EXT_external_memory_host) instead of copying them. Operands are imported
+    // per op: the scheduler may free and reuse their memory, and an import keeps the old pages.
+    // Only the worker's own result scratch is cached, by page-aligned range.
     bool      vk_zero_copy = true;
     uintptr_t vk_import_align = 4096;
     std::map<std::pair<uintptr_t, uintptr_t>, ggml_backend_buffer_t> vk_imports;
@@ -963,8 +964,8 @@ static float * ggml_xdna_vk_out_scratch(ggml_backend_xdna_context * ctx, size_t 
     return (float *) ctx->vk_out;
 }
 
-// zero-copy variant: the activations are the caller's host memory imported into the device, the
-// result lands in an imported host scratch and is scattered into dst's rows on the CPU (Vulkan's
+// zero-copy variant: the activations are the caller's host memory imported into the device for this
+// op, the result lands in an imported host scratch and is scattered into dst's rows on the CPU (Vulkan's
 // split-k matmul path needs a contiguous destination); the weight slice is a cached device copy.
 // 2-D operands only.
 static bool ggml_xdna_mul_mat_vk_zero_copy(ggml_backend_xdna_context * ctx, struct ggml_tensor * dst, int64_t feat0, int64_t feat1) {
@@ -990,10 +991,13 @@ static bool ggml_xdna_mul_mat_vk_zero_copy(ggml_backend_xdna_context * ctx, stru
     void * addr_b = nullptr;
     void * addr_c = nullptr;
     const size_t c_bytes = (size_t) n_rows*src1->ne[1]*sizeof(float);
-    ggml_backend_buffer_t buf_b = ggml_xdna_vk_import(ctx, src1->data, ggml_nbytes(src1), &addr_b);
+    ggml_backend_buffer_t buf_b = ggml_xdna_vk_import_uncached(ctx, src1->data, ggml_nbytes(src1), &addr_b);
     float * out = buf_b != nullptr ? ggml_xdna_vk_out_scratch(ctx, c_bytes) : nullptr;
     ggml_backend_buffer_t buf_c = out != nullptr ? ggml_xdna_vk_import(ctx, out, ctx->vk_out_size, &addr_c) : nullptr;
     if (buf_c == nullptr) {
+        if (buf_b != nullptr) {
+            ggml_backend_buffer_free(buf_b);
+        }
         return false;
     }
     const double t_import = ms_since(t0);
@@ -1003,6 +1007,7 @@ static bool ggml_xdna_mul_mat_vk_zero_copy(ggml_backend_xdna_context * ctx, stru
     int64_t row0   = 0;
     ggml_tensor * w = ggml_xdna_vk_weight_slice(ctx, src0, feat0, feat1, temp, cached, row0);
     if (w == nullptr) {
+        ggml_backend_buffer_free(buf_b);
         return false;
     }
     const double t_weights = ms_since(t0);
@@ -1043,6 +1048,7 @@ static bool ggml_xdna_mul_mat_vk_zero_copy(ggml_backend_xdna_context * ctx, stru
         }
     }
 
+    ggml_backend_buffer_free(buf_b);
     if (!cached) {
         ggml_backend_buffer_free(temp.buf);
         ggml_free(temp.wctx);
