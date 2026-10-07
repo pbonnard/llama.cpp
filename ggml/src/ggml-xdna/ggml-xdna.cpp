@@ -3158,8 +3158,96 @@ static const char * ggml_backend_xdna_get_name(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// the auto split needs a few hundred ops to learn the workers' speeds on a model's shapes. With
+// GGML_XDNA_CALIB set to a file path, the learned table is read at startup and written back at exit,
+// so a run starts from the last run's speeds instead of the MAC rate prior. npu_seen and vk_bad are
+// not saved: the first NPU run of a shape still pays first-use costs, and a Vulkan failure on one
+// run must not keep the worker off that shape for good.
+static const int GGML_XDNA_CALIB_VERSION = 1;
+
+static void ggml_xdna_calib_load(ggml_backend_xdna_context * ctx) {
+    const char * path = ggml_xdna_getenv("GGML_XDNA_CALIB");
+    if (path == nullptr) {
+        return;
+    }
+
+    std::ifstream f(path);
+    if (!f) {
+        return;   // no file yet: the first run writes it
+    }
+
+    std::string tag;
+    int version = 0;
+    if (!(f >> tag >> version) || tag != "ggml-xdna-calib" || version != GGML_XDNA_CALIB_VERSION) {
+        GGML_LOG_WARN("%s: ignoring '%s', not a version %d calibration file\n", __func__, path, GGML_XDNA_CALIB_VERSION);
+        return;
+    }
+
+    int n = 0;
+    std::string kind;
+    while (f >> kind) {
+        if (kind == "mac") {
+            if (!(f >> ctx->mac_thr[0] >> ctx->mac_thr[1] >> ctx->mac_thr[2])) {
+                break;
+            }
+        } else if (kind == "s") {
+            int64_t ne1 = 0, ne0 = 0;
+            int     key = 0;
+            double  thr[GGML_XDNA_N_WORKERS] = { 0.0, 0.0, 0.0 };
+            double  corr = 0.0;
+            if (!(f >> ne1 >> ne0 >> key >> thr[0] >> thr[1] >> thr[2] >> corr)) {
+                break;
+            }
+            auto & sp = ctx->shape_perf_map[std::make_tuple(ne1, ne0, key)];
+            for (int i = 0; i < GGML_XDNA_N_WORKERS; i++) {
+                sp.thr[i] = thr[i];
+            }
+            sp.npu_corr = corr;
+            n++;
+        } else {
+            break;
+        }
+    }
+
+    if (ggml_xdna_debug()) {
+        GGML_LOG_INFO("xdna_calib: read %d shapes from %s\n", n, path);
+    }
+}
+
+static void ggml_xdna_calib_save(const ggml_backend_xdna_context * ctx) {
+    const char * path = ggml_xdna_getenv("GGML_XDNA_CALIB");
+    if (path == nullptr) {
+        return;
+    }
+
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) {
+        GGML_LOG_WARN("%s: cannot write the calibration file '%s'\n", __func__, path);
+        return;
+    }
+
+    f << "ggml-xdna-calib " << GGML_XDNA_CALIB_VERSION << "\n";
+    f << "mac " << ctx->mac_thr[0] << " " << ctx->mac_thr[1] << " " << ctx->mac_thr[2] << "\n";
+
+    int n = 0;
+    for (const auto & kv : ctx->shape_perf_map) {
+        const auto & sp = kv.second;
+        if (sp.thr[GGML_XDNA_WORKER_VK] <= 0.0 && sp.thr[GGML_XDNA_WORKER_CPU] <= 0.0 && sp.npu_corr <= 0.0) {
+            continue;
+        }
+        f << "s " << std::get<0>(kv.first) << " " << std::get<1>(kv.first) << " " << std::get<2>(kv.first)
+          << " " << sp.thr[0] << " " << sp.thr[1] << " " << sp.thr[2] << " " << sp.npu_corr << "\n";
+        n++;
+    }
+
+    if (ggml_xdna_debug()) {
+        GGML_LOG_INFO("xdna_calib: wrote %d shapes to %s\n", n, path);
+    }
+}
+
 static void ggml_backend_xdna_free(ggml_backend_t backend) {
     ggml_backend_xdna_context * ctx = (ggml_backend_xdna_context *) backend->context;
+    ggml_xdna_calib_save(ctx);
     ggml_xdna_warm_release();
     if (ctx->cpu) {
         ggml_backend_free(ctx->cpu);
@@ -3243,6 +3331,7 @@ ggml_backend_t ggml_backend_xdna_init(void) {
     ggml_xdna_probe(ggml_xdna_get_state());
 
     ggml_backend_xdna_context * ctx = new ggml_backend_xdna_context;
+    ggml_xdna_calib_load(ctx);
     ggml_xdna_init_shares(ctx);    // creates the workers now, so the warm-up knows the NPU's share
     ggml_xdna_warm_acquire(ctx);
 
