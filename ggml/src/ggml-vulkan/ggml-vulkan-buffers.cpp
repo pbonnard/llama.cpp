@@ -245,9 +245,9 @@ void ggml_vk_destroy_buffer(vk_buffer& buf) {
 
 void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
+    // host buffers hold CPU tensors: uncached memory makes CPU reads very slow, so let the caller fall back to a CPU buffer
     vk_buffer buf = ggml_vk_create_buffer(device, size,
-        {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
-         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+        {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached});
 
     if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
         fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
