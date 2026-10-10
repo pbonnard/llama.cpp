@@ -16,6 +16,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -2041,6 +2042,188 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     );
 }
 
+// hybrid expert placement for offloaded prompt batches (LLAMA_MOE_HYBRID=<min tokens>):
+// experts with fewer tokens than the threshold run on the CPU instead of being uploaded to the GPU
+
+static int32_t moe_hybrid_thr() {
+    static const int32_t thr = [] { const char * s = getenv("LLAMA_MOE_HYBRID"); return s ? atoi(s) : 0; }();
+    return thr;
+}
+
+static int32_t moe_hybrid_cap() {
+    static const int32_t cap = [] { const char * s = getenv("LLAMA_MOE_HYBRID_CAP"); return s ? atoi(s) : 512; }();
+    return cap;
+}
+
+// marks the experts that go to the CPU (at most n_cpu slots, fewest tokens first)
+// returns the gpu experts, most used first; the n_used most used experts always stay on the gpu
+static std::vector<int32_t> moe_hybrid_assign(const ggml_tensor * ids, int64_t n_cpu, std::vector<uint8_t> & on_cpu) {
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tok  = ids->ne[1];
+
+    std::vector<int32_t> cnt(on_cpu.size(), 0);
+    for (int64_t t = 0; t < n_tok; t++) {
+        for (int64_t j = 0; j < n_used; j++) {
+            cnt[*(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0])]++;
+        }
+    }
+
+    std::vector<int32_t> order(cnt.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return cnt[a] < cnt[b]; });
+
+    std::fill(on_cpu.begin(), on_cpu.end(), 0);
+    int64_t n = 0;
+    for (size_t i = 0; i + n_used < order.size(); i++) {
+        const int32_t e = order[i];
+        if (cnt[e] == 0) {
+            continue;
+        }
+        if (cnt[e] >= moe_hybrid_thr() || n + cnt[e] > n_cpu) {
+            break;
+        }
+        on_cpu[e] = 1;
+        n += cnt[e];
+    }
+
+    std::vector<int32_t> gpu;
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+        if (!on_cpu[*it]) {
+            gpu.push_back(*it);
+        }
+    }
+    return gpu;
+}
+
+// dst (I32): [gpu ids (n_used*n_tok) | cpu token (n_cpu) | cpu expert (n_cpu), -1 = padding | summed cpu row per token (n_tok), n_cpu = none]
+static void moe_hybrid_split_ids(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * ids = dst->src[0];
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tok  = ids->ne[1];
+    const int64_t n_cpu  = (dst->ne[0] - n_used*n_tok - n_tok)/2;
+    const int64_t n_exp  = (int64_t) (intptr_t) userdata;
+
+    std::vector<uint8_t> on_cpu(n_exp);
+    const std::vector<int32_t> gpu = moe_hybrid_assign(ids, n_cpu, on_cpu);
+
+    int32_t * gpu_ids = (int32_t *) dst->data;
+    int32_t * cpu_tok = gpu_ids + n_used*n_tok;
+    int32_t * cpu_exp = cpu_tok + n_cpu;
+    int32_t * cpu_map = cpu_exp + n_cpu;
+
+    // the gpu kernels expect distinct experts per token, so each cpu slot is replaced
+    // by a gpu expert the token does not use yet
+    int64_t r = 0;
+    int32_t n_rows = 0;
+    for (int64_t t = 0; t < n_tok; t++) {
+        int32_t * row = gpu_ids + t*n_used;
+        const int64_t r0 = r;
+        for (int64_t j = 0; j < n_used; j++) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]);
+            row[j] = on_cpu[e] ? -1 : e;
+            if (on_cpu[e]) {
+                cpu_tok[r] = (int32_t) t;
+                cpu_exp[r] = e;
+                r++;
+            }
+        }
+        size_t k = 0;
+        for (int64_t j = 0; j < n_used; j++) {
+            if (row[j] >= 0) {
+                continue;
+            }
+            while (std::find(row, row + n_used, gpu[k]) != row + n_used) {
+                k++;
+            }
+            row[j] = gpu[k];
+        }
+        cpu_map[t] = r > r0 ? n_rows++ : (int32_t) n_cpu;
+    }
+    for (; r < n_cpu; r++) {
+        cpu_tok[r] = 0;
+        cpu_exp[r] = -1;
+    }
+}
+
+// dst (F32): [gpu weights (n_used*n_tok), 0 for cpu slots | cpu weights (n_cpu)]
+static void moe_hybrid_split_w(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * ids = dst->src[0];
+    const ggml_tensor * w   = dst->src[1];
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tok  = ids->ne[1];
+    const int64_t n_cpu  = dst->ne[0] - n_used*n_tok;
+    const int64_t n_exp  = (int64_t) (intptr_t) userdata;
+
+    std::vector<uint8_t> on_cpu(n_exp);
+    moe_hybrid_assign(ids, n_cpu, on_cpu);
+
+    float * gpu_w = (float *) dst->data;
+    float * cpu_w = gpu_w + n_used*n_tok;
+
+    int64_t r = 0;
+    for (int64_t t = 0; t < n_tok; t++) {
+        for (int64_t j = 0; j < n_used; j++) {
+            const int32_t e  = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + j*ids->nb[0]);
+            const float   wv = *(const float   *) ((const char *) w->data   + t*w->nb[2]   + j*w->nb[1]);
+            if (on_cpu[e]) {
+                gpu_w[t*n_used + j] = 0.0f;
+                cpu_w[r++] = wv;
+            } else {
+                gpu_w[t*n_used + j] = wv;
+            }
+        }
+    }
+    for (; r < n_cpu; r++) {
+        cpu_w[r] = 0.0f;
+    }
+}
+
+// dst [n_embd, n_cpu + 1]: per token with cpu slots, in token order, the sum of w * down over its slots
+// unused rows (and the extra last row) are 0; src: down [n_embd, 1, n_cpu], w, exp, tok
+static void moe_hybrid_weigh(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(userdata);
+
+    const ggml_tensor * down = dst->src[0];
+    const float   * w   = (const float   *) dst->src[1]->data;
+    const int32_t * exp = (const int32_t *) dst->src[2]->data;
+    const int32_t * tok = (const int32_t *) dst->src[3]->data;
+
+    const int64_t n_embd = dst->ne[0];
+    const int64_t n_rows = dst->ne[1];
+    const int64_t n_cpu  = down->ne[2];
+
+    // each thread owns the output rows o with o % nth == ith
+    for (int64_t o = ith; o < n_rows; o += nth) {
+        memset((char *) dst->data + o*dst->nb[1], 0, n_embd*sizeof(float));
+    }
+
+    int64_t o = -1;
+    for (int64_t r = 0; r < n_cpu && exp[r] >= 0; r++) {
+        if (r == 0 || tok[r] != tok[r - 1]) {
+            o++;
+        }
+        if (o % nth != ith) {
+            continue;
+        }
+        const float * src = (const float *) ((const char *) down->data + r*down->nb[2]);
+        float       * out = (float       *) ((char       *) dst->data  + o*dst->nb[1]);
+        for (int64_t i = 0; i < n_embd; i++) {
+            out[i] += w[r]*src[i];
+        }
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2204,6 +2387,54 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // hybrid placement: only for host-resident experts in batches large enough to be offloaded
+    ggml_tensor * hyb_rows = nullptr;
+    ggml_tensor * hyb_map  = nullptr;
+    if (moe_hybrid_thr() > 0 && cparams.op_offload && n_tokens >= 32 &&
+        !weight_before_ffn && type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        (il < 0 || hparams.swiglu_clamp_exp[il] <= 1e-6f) && loras->empty() &&
+        up_exps->buffer && ggml_backend_buffer_is_host(up_exps->buffer)) {
+        const int64_t n_slots = n_expert_used*n_tokens;
+        const int64_t n_cpu   = std::min<int64_t>(moe_hybrid_cap(), n_slots);
+        void * ud = (void *) (intptr_t) up_exps->ne[2];
+
+        ggml_tensor * args_i[1] = { selected_experts };
+        ggml_tensor * split_i = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_slots + 2*n_cpu + n_tokens, 1, 1, 1, args_i, 1, moe_hybrid_split_ids, 1, ud);
+        cb(split_i, "ffn_moe_hyb_cpu_split_ids", il);
+
+        ggml_tensor * args_w[2] = { selected_experts, weights };
+        ggml_tensor * split_w = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_slots + n_cpu, 1, 1, 1, args_w, 2, moe_hybrid_split_w, 1, ud);
+        cb(split_w, "ffn_moe_hyb_cpu_split_w", il);
+
+        ggml_tensor * cpu_tok = ggml_view_1d(ctx0, split_i, n_cpu, n_slots*sizeof(int32_t));
+        ggml_tensor * cpu_exp = ggml_view_2d(ctx0, split_i, 1, n_cpu, sizeof(int32_t), (n_slots + n_cpu)*sizeof(int32_t));
+        ggml_tensor * cpu_w   = ggml_view_1d(ctx0, split_w, n_cpu, n_slots*sizeof(float));
+
+        // gather the cpu rows where the activations live, so only n_cpu rows cross the bus
+        ggml_tensor * xc = ggml_get_rows(ctx0, cur, cpu_tok); // [n_embd, n_cpu]
+        cb(xc, "ffn_moe_hyb_gpu_x", il);
+        xc = ggml_reshape_3d(ctx0, xc, n_embd, 1, n_cpu);
+
+        ggml_tensor * uc = ggml_mul_mat_id(ctx0, up_exps, xc, cpu_exp); // [n_ff, 1, n_cpu]
+        cb(uc, "ffn_moe_hyb_cpu_up", il);
+        ggml_tensor * gc = ggml_mul_mat_id(ctx0, gate_exps, xc, cpu_exp);
+        cb(gc, "ffn_moe_hyb_cpu_gate", il);
+        ggml_tensor * ac = ggml_swiglu_split(ctx0, gc, uc);
+        cb(ac, "ffn_moe_hyb_cpu_swiglu", il);
+        ggml_tensor * dc = ggml_mul_mat_id(ctx0, down_exps, ac, cpu_exp); // [n_embd, 1, n_cpu]
+        cb(dc, "ffn_moe_hyb_cpu_down", il);
+
+        ggml_tensor * args_c[4] = { dc, cpu_w, cpu_exp, cpu_tok };
+        hyb_rows = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_cpu + 1, 1, 1, args_c, 4, moe_hybrid_weigh, GGML_N_TASKS_MAX, nullptr);
+        cb(hyb_rows, "ffn_moe_hyb_cpu_rows", il);
+        hyb_map = ggml_view_2d(ctx0, split_i, 1, n_tokens, sizeof(int32_t), (n_slots + 2*n_cpu)*sizeof(int32_t));
+
+        // the gpu path sees the cpu slots as unused experts with weight 0
+        selected_experts = ggml_view_2d(ctx0, split_i, n_expert_used, n_tokens, n_expert_used*sizeof(int32_t), 0);
+        weights          = ggml_view_3d(ctx0, split_w, 1, n_expert_used, n_tokens, sizeof(float), n_expert_used*sizeof(float), 0);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2402,6 +2633,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    if (hyb_rows) {
+        // add the per-token cpu sums, after the reduction so it stays fused
+        moe_out = ggml_add_id(ctx0, ggml_reshape_3d(ctx0, moe_out, n_embd, 1, n_tokens), hyb_rows, hyb_map);
+        cb(moe_out, "ffn_moe_hyb_gpu_add", il);
+        moe_out = ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
     }
 
     cb(moe_out, "ffn_moe_out", il);

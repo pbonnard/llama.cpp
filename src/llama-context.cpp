@@ -2711,6 +2711,19 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        // pin the two halves of the hybrid MoE placement (see build_moe_ffn)
+        if (backend_cpu != nullptr && strncmp(name, "ffn_moe_hyb_cpu", 15) == 0) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
+        }
+        if (il >= 0 && strncmp(name, "ffn_moe_hyb_gpu", 15) == 0) {
+            const auto & dev_layer = model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer && ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                }
+            }
+        }
+
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // - force the last op of the layer on the specified backend to avoid running it on the backend of the next layer due to scheduling
         // FIXME: fix in ggml_backend_sched
