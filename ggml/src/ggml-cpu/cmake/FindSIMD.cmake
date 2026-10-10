@@ -28,6 +28,40 @@ set(AVX512_CODE "
     }
 ")
 
+set(AVX512_VNNI_CODE "
+    #include <immintrin.h>
+    int main()
+    {
+        volatile int v = 1;
+        __m512i a = _mm512_set1_epi8((char) v);
+        a = _mm512_dpbusd_epi32(a, a, a);
+        return _mm512_reduce_add_epi32(a) == 0;
+    }
+")
+
+set(AVX512_VBMI_CODE "
+    #include <immintrin.h>
+    int main()
+    {
+        volatile int v = 1;
+        __m512i a = _mm512_set1_epi8((char) v);
+        a = _mm512_permutexvar_epi8(a, a);
+        return _mm512_reduce_add_epi32(a) == 0;
+    }
+")
+
+set(AVX512_BF16_CODE "
+    #include <immintrin.h>
+    int main()
+    {
+        volatile float v = 1.0f;
+        __m512 a = _mm512_set1_ps(v);
+        __m512bh b = _mm512_cvtne2ps_pbh(a, a);
+        a = _mm512_dpbf16_ps(a, b, b);
+        return _mm512_reduce_add_ps(a) == 0.0f;
+    }
+")
+
 set(AVX2_CODE "
     #include <immintrin.h>
     int main()
@@ -97,4 +131,14 @@ if (NOT ${AVX512_FOUND})
     set(GGML_AVX512 OFF)
 else()
     set(GGML_AVX512 ON)
+
+    # MSVC defines no macros for these extensions, so detect them by running code
+    check_sse("AVX512_VNNI" "/arch:AVX512")
+    check_sse("AVX512_VBMI" "/arch:AVX512")
+    check_sse("AVX512_BF16" "/arch:AVX512")
+    foreach (ext VNNI VBMI BF16)
+        if (${AVX512_${ext}_FOUND})
+            set(GGML_AVX512_${ext} ON)
+        endif()
+    endforeach()
 endif()
